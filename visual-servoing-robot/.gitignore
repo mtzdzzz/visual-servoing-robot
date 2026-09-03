@@ -1,0 +1,7 @@
+.venv/
+.python310-base/
+.venv-broken-python310/
+.venv-broken-python313/
+
+__pycache__/
+*.pyc

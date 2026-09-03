@@ -8,6 +8,7 @@ Gazebo integration.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from math import sqrt
 import time
 from typing import Sequence
@@ -43,22 +44,51 @@ CAMERA_REFERENCE_FRAME_NAME = "C"
 # the selected end-effector frame E: T_E_C = Identity.
 T_E_C_POSITION = (0.0, 0.0, 0.0)
 T_E_C_ORIENTATION = (0.0, 0.0, 0.0, 1.0)
-# A tested, reachable world position for the future camera origin C, in metres.
-SAFE_CAMERA_ORIGIN_TARGET_POSITION = (0.45, 0.00, 0.55)
+# A tested upper-arm-workspace position for the future camera origin C, in metres.
+SAFE_CAMERA_ORIGIN_TARGET_POSITION = (0.09, -0.09, 1.08)
 DEFAULT_CAMERA_REFERENCE_TARGET_SEQUENCE = (
     ("Camera Origin Test", SAFE_CAMERA_ORIGIN_TARGET_POSITION),
 )
+LOCKING_STRATEGIES = (
+    (
+        "A",
+        ("panda_joint1", "panda_joint2", "panda_joint3"),
+    ),
+)
+LOCKED_JOINT_DEVIATION_LIMIT = 0.005  # radians
+CAMERA_TARGET_ERROR_LIMIT = 0.01  # metres
+CONSTRAINED_IK_MAX_ITERATIONS = 250
+CONSTRAINED_IK_POSITION_TOLERANCE = 0.001  # metres
+CONSTRAINED_IK_JACOBIAN_DELTA = 1e-4  # radians
+CONSTRAINED_IK_MAX_STEP = 0.08  # radians per numerical iteration
+CONSTRAINED_IK_DAMPING = 0.002
 MAX_IK_JOINT_VELOCITY = 0.20  # radians/second
 MAX_IK_MOTOR_FORCE = 20.0
 IK_VELOCITY_GAIN = 0.8
 TRAJECTORY_MAX_WAYPOINT_SPEED = 0.18  # radians/second
-POSITION_STATUS_INTERVAL_SECONDS = 1.0
+# Both the startup hold and the IK-motion phase report their lock error at the
+# same cadence.  Keeping this independent of the 240 Hz physics rate prevents
+# terminal spam while still exposing a control overwrite immediately.
+CONTROL_STATUS_INTERVAL_SECONDS = 0.5
 MIN_TRAJECTORY_DURATION = 5.0  # seconds; Stage 3 visual-motion minimum
 POST_TRAJECTORY_SETTLE_SECONDS = 3.0
 STARTUP_PAUSE_SECONDS = 3.0
 DEBUG_STATUS_TEXT_POSITION = (0.0, 0.0, 1.35)
 DEBUG_TARGET_MARKER_SIZE = 0.045
 CAMERA_AXIS_LENGTH = 0.10
+
+
+@dataclass(frozen=True)
+class LockingStrategyEvaluation:
+    """Measured result of one locked-joint motion strategy."""
+
+    name: str
+    locked_joint_names: tuple[str, ...]
+    active_joint_names: tuple[str, ...]
+    final_camera_error: float
+    max_locked_deviation: float
+    motion_stable: bool
+    reachable: bool
 
 
 def _decode_name(value: bytes | str) -> str:
@@ -176,6 +206,35 @@ def get_panda_arm_joint_indices(robot_id: int, client_id: int) -> list[int]:
             f"but found {arm_joint_indices}."
         )
     return arm_joint_indices
+
+
+def get_panda_arm_joint_names(robot_id: int, client_id: int) -> dict[str, int]:
+    """Read Panda's seven revolute joint names and indices from the URDF."""
+    joint_names = {}
+    for joint_index in get_panda_arm_joint_indices(robot_id, client_id):
+        joint_info = p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)
+        joint_names[_decode_name(joint_info[1])] = joint_index
+    return joint_names
+
+
+def print_panda_arm_joint_configuration(robot_id: int, client_id: int) -> dict[int, float]:
+    """Print all arm-joint names, limits, and recorded initial positions."""
+    initial_positions: dict[int, float] = {}
+    print("\nPanda revolute arm-joint inspection:")
+    for joint_index in get_panda_arm_joint_indices(robot_id, client_id):
+        joint_info = p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)
+        initial_position = p.getJointState(
+            robot_id,
+            joint_index,
+            physicsClientId=client_id,
+        )[0]
+        initial_positions[joint_index] = initial_position
+        print(
+            f"  index={joint_index}, name={_decode_name(joint_info[1])}, "
+            f"type=revolute, limits=({joint_info[8]:.4f}, {joint_info[9]:.4f}), "
+            f"initial={initial_position:.4f} rad"
+        )
+    return initial_positions
 
 
 def get_link_index_by_name(robot_id: int, link_name: str, client_id: int) -> int:
@@ -318,6 +377,179 @@ def calculate_position_only_ik(
     return arm_joint_indices, [solution_by_joint[index] for index in arm_joint_indices]
 
 
+def _invert_3x3(matrix: list[list[float]]) -> list[list[float]] | None:
+    """Return a 3×3 inverse without adding a numerical-library dependency."""
+    determinant = (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+    if abs(determinant) < 1e-12:
+        return None
+    return [
+        [
+            (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+            / determinant,
+            (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2])
+            / determinant,
+            (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1])
+            / determinant,
+        ],
+        [
+            (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2])
+            / determinant,
+            (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0])
+            / determinant,
+            (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2])
+            / determinant,
+        ],
+        [
+            (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+            / determinant,
+            (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1])
+            / determinant,
+            (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0])
+            / determinant,
+        ],
+    ]
+
+
+def _set_arm_joint_positions(
+    robot_id: int,
+    arm_joint_indices: Sequence[int],
+    joint_positions: Sequence[float],
+    client_id: int,
+) -> None:
+    for joint_index, joint_position in zip(arm_joint_indices, joint_positions):
+        p.resetJointState(
+            robot_id,
+            joint_index,
+            joint_position,
+            physicsClientId=client_id,
+        )
+
+
+def calculate_constrained_position_ik(
+    robot_id: int,
+    target_position: Sequence[float],
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> tuple[list[int], list[float], float]:
+    """Solve position IK while allowing numerical updates only on active joints.
+
+    PyBullet's ``calculateInverseKinematics`` still provides the nominal full
+    solution, but it is never executed as-is.  A damped finite-difference
+    position-IK refinement holds every locked joint at its recorded initial
+    angle and computes targets solely for the active joints.
+    """
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    locked_joint_indices = list(locked_joint_indices)
+    active_joint_indices = [
+        joint_index for joint_index in arm_joint_indices if joint_index not in locked_joint_indices
+    ]
+    if not active_joint_indices:
+        raise ValueError("At least one Panda arm joint must remain active for IK.")
+
+    saved_positions = [
+        p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+        for joint_index in arm_joint_indices
+    ]
+    # Required nominal PyBullet IK result.  It is intentionally not sent to
+    # motors, because it may move the joints selected for locking.
+    calculate_position_only_ik(robot_id, target_position, client_id)
+
+    joint_limits = {
+        joint_index: (
+            p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[8],
+            p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[9],
+        )
+        for joint_index in arm_joint_indices
+    }
+    candidate_positions = dict(zip(arm_joint_indices, saved_positions))
+    candidate_positions.update(locked_initial_positions)
+
+    final_error = float("inf")
+    try:
+        for _ in range(CONSTRAINED_IK_MAX_ITERATIONS):
+            _set_arm_joint_positions(
+                robot_id,
+                arm_joint_indices,
+                [candidate_positions[index] for index in arm_joint_indices],
+                client_id,
+            )
+            actual_position = get_end_effector_position(robot_id, client_id)
+            position_error = [
+                target - actual for target, actual in zip(target_position, actual_position)
+            ]
+            final_error = sqrt(sum(component * component for component in position_error))
+            if final_error <= CONSTRAINED_IK_POSITION_TOLERANCE:
+                break
+
+            jacobian = [[0.0 for _ in active_joint_indices] for _ in range(3)]
+            for column, joint_index in enumerate(active_joint_indices):
+                candidate_positions[joint_index] += CONSTRAINED_IK_JACOBIAN_DELTA
+                _set_arm_joint_positions(
+                    robot_id,
+                    arm_joint_indices,
+                    [candidate_positions[index] for index in arm_joint_indices],
+                    client_id,
+                )
+                perturbed_position = get_end_effector_position(robot_id, client_id)
+                candidate_positions[joint_index] -= CONSTRAINED_IK_JACOBIAN_DELTA
+                for row in range(3):
+                    jacobian[row][column] = (
+                        perturbed_position[row] - actual_position[row]
+                    ) / CONSTRAINED_IK_JACOBIAN_DELTA
+
+            normal_matrix = [
+                [
+                    sum(
+                        jacobian[row][column] * jacobian[other_row][column]
+                        for column in range(len(active_joint_indices))
+                    )
+                    + (CONSTRAINED_IK_DAMPING if row == other_row else 0.0)
+                    for other_row in range(3)
+                ]
+                for row in range(3)
+            ]
+            inverse_normal_matrix = _invert_3x3(normal_matrix)
+            if inverse_normal_matrix is None:
+                break
+            damped_error = [
+                sum(inverse_normal_matrix[row][column] * position_error[column] for column in range(3))
+                for row in range(3)
+            ]
+            joint_updates = [
+                sum(jacobian[row][column] * damped_error[row] for row in range(3))
+                for column in range(len(active_joint_indices))
+            ]
+            largest_update = max((abs(update) for update in joint_updates), default=0.0)
+            update_scale = min(
+                1.0,
+                CONSTRAINED_IK_MAX_STEP / max(largest_update, 1e-12),
+            )
+            for joint_index, joint_update in zip(active_joint_indices, joint_updates):
+                lower_limit, upper_limit = joint_limits[joint_index]
+                candidate_positions[joint_index] = max(
+                    lower_limit,
+                    min(
+                        upper_limit,
+                        candidate_positions[joint_index] + joint_update * update_scale,
+                    ),
+                )
+            for joint_index in locked_joint_indices:
+                candidate_positions[joint_index] = locked_initial_positions[joint_index]
+    finally:
+        _set_arm_joint_positions(robot_id, arm_joint_indices, saved_positions, client_id)
+
+    return (
+        arm_joint_indices,
+        [candidate_positions[index] for index in arm_joint_indices],
+        final_error,
+    )
+
+
 def _smoothstep(progress: float) -> float:
     """Ease a zero-to-one trajectory progress with zero endpoint velocity."""
     bounded_progress = max(0.0, min(1.0, progress))
@@ -371,6 +603,212 @@ def apply_arm_position_control(
             maxVelocity=MAX_IK_JOINT_VELOCITY,
             physicsClientId=client_id,
         )
+
+
+def apply_constrained_arm_position_control(
+    robot_id: int,
+    arm_joint_indices: Sequence[int],
+    waypoint_positions: Sequence[float],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> None:
+    """Control all seven arm joints while forcing locked ones to their initial q."""
+    if len(arm_joint_indices) != 7 or len(waypoint_positions) != 7:
+        raise ValueError("Constrained POSITION_CONTROL requires seven Panda arm targets.")
+    constrained_waypoints = [
+        locked_initial_positions.get(joint_index, waypoint_position)
+        for joint_index, waypoint_position in zip(arm_joint_indices, waypoint_positions)
+    ]
+    apply_arm_position_control(
+        robot_id,
+        arm_joint_indices,
+        constrained_waypoints,
+        client_id,
+    )
+
+
+def get_locked_joint_deviations(
+    robot_id: int,
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> dict[int, float]:
+    """Measure the signed locked-joint deviations from their recorded starts."""
+    return {
+        joint_index: p.getJointState(
+            robot_id,
+            joint_index,
+            physicsClientId=client_id,
+        )[0]
+        - initial_position
+        for joint_index, initial_position in locked_initial_positions.items()
+    }
+
+
+def print_locked_joint_status(
+    phase: str,
+    robot_id: int,
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> float:
+    """Print each locked joint's measured state and immutable target."""
+    if phase not in {"HOLD", "MOVE"}:
+        raise ValueError("phase must be either 'HOLD' or 'MOVE'.")
+    joint_names = {
+        joint_index: _decode_name(
+            p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]
+        )
+        for joint_index in locked_initial_positions
+    }
+    deviations = get_locked_joint_deviations(
+        robot_id,
+        locked_initial_positions,
+        client_id,
+    )
+    print(f"phase = {phase}")
+    for joint_index in sorted(deviations):
+        locked_target = locked_initial_positions[joint_index]
+        current_position = locked_target + deviations[joint_index]
+        print(
+            f"  {joint_names[joint_index]}: "
+            f"current angle = {current_position:.6f} rad, "
+            f"locked target angle = {locked_target:.6f} rad, "
+            f"deviation = {deviations[joint_index]:.6f} rad"
+        )
+    return max((abs(deviation) for deviation in deviations.values()), default=0.0)
+
+
+def evaluate_locking_strategy(
+    strategy_name: str,
+    locked_joint_names: tuple[str, ...],
+    target_position: Sequence[float],
+) -> LockingStrategyEvaluation:
+    """Run one strategy in DIRECT mode and return measured feasibility metrics."""
+    client_id = p.connect(p.DIRECT)
+    if client_id < 0:
+        raise RuntimeError("Unable to create a DIRECT client for strategy evaluation.")
+
+    try:
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        p.setGravity(0, 0, 0, physicsClientId=client_id)
+        p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+        robot_id = p.loadURDF(
+            "franka_panda/panda.urdf",
+            useFixedBase=True,
+            physicsClientId=client_id,
+        )
+        arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+        locked_joint_indices = [arm_joint_names[name] for name in locked_joint_names]
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        active_joint_names = tuple(
+            name for name, index in arm_joint_names.items() if index not in locked_joint_indices
+        )
+        locked_initial_positions = {
+            joint_index: p.getJointState(
+                robot_id,
+                joint_index,
+                physicsClientId=client_id,
+            )[0]
+            for joint_index in locked_joint_indices
+        }
+        _, joint_targets, _ = calculate_constrained_position_ik(
+            robot_id,
+            target_position,
+            locked_joint_indices,
+            locked_initial_positions,
+            client_id,
+        )
+        start_positions = [
+            p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+            for joint_index in arm_joint_indices
+        ]
+        trajectory_duration = calculate_trajectory_duration(start_positions, joint_targets)
+        total_steps = round(
+            (trajectory_duration + POST_TRAJECTORY_SETTLE_SECONDS) / TIME_STEP
+        )
+        motion_steps = round(trajectory_duration / TIME_STEP)
+        max_locked_deviation = 0.0
+        settled_errors = []
+        for simulation_step in range(total_steps):
+            interpolation = _smoothstep(simulation_step * TIME_STEP / trajectory_duration)
+            waypoint_positions = [
+                start + interpolation * (target - start)
+                for start, target in zip(start_positions, joint_targets)
+            ]
+            apply_constrained_arm_position_control(
+                robot_id,
+                arm_joint_indices,
+                waypoint_positions,
+                locked_initial_positions,
+                client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            deviations = get_locked_joint_deviations(
+                robot_id,
+                locked_initial_positions,
+                client_id,
+            )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                max((abs(deviation) for deviation in deviations.values()), default=0.0),
+            )
+            if simulation_step >= motion_steps:
+                actual_position = get_end_effector_position(robot_id, client_id)
+                settled_errors.append(
+                    sqrt(
+                        sum(
+                            (target - actual) ** 2
+                            for target, actual in zip(target_position, actual_position)
+                        )
+                    )
+                )
+
+        final_camera_error = settled_errors[-1]
+        settling_variation = max(settled_errors) - min(settled_errors)
+        motion_stable = (
+            settling_variation < 0.003
+            and max_locked_deviation < LOCKED_JOINT_DEVIATION_LIMIT
+        )
+        reachable = (
+            final_camera_error < CAMERA_TARGET_ERROR_LIMIT
+            and max_locked_deviation < LOCKED_JOINT_DEVIATION_LIMIT
+        )
+        return LockingStrategyEvaluation(
+            name=strategy_name,
+            locked_joint_names=locked_joint_names,
+            active_joint_names=active_joint_names,
+            final_camera_error=final_camera_error,
+            max_locked_deviation=max_locked_deviation,
+            motion_stable=motion_stable,
+            reachable=reachable,
+        )
+    finally:
+        if p.isConnected(client_id):
+            p.disconnect(physicsClientId=client_id)
+
+
+def print_locking_strategy_comparison(
+    evaluations: Sequence[LockingStrategyEvaluation],
+) -> None:
+    """Print the requested A/B comparison before choosing a GUI strategy."""
+    print("\nConstrained IK strategy comparison:")
+    for evaluation in evaluations:
+        print(f"Strategy {evaluation.name}:")
+        print("  locked joints:", list(evaluation.locked_joint_names))
+        print("  active joints:", list(evaluation.active_joint_names))
+        print(f"  final camera position error: {evaluation.final_camera_error:.4f} m")
+        print(f"  locked joint max deviation: {evaluation.max_locked_deviation:.6f} rad")
+        print(f"  motion stable: {'yes' if evaluation.motion_stable else 'no'}")
+        print(f"  reachable: {'yes' if evaluation.reachable else 'no'}")
+
+
+def choose_locking_strategy(
+    evaluations: Sequence[LockingStrategyEvaluation],
+) -> LockingStrategyEvaluation | None:
+    """Prefer the most restrictive stable strategy that still reaches C accurately."""
+    for evaluation in evaluations:
+        if evaluation.reachable and evaluation.motion_stable:
+            return evaluation
+    return None
 
 
 def get_end_effector_position(robot_id: int, client_id: int) -> list[float]:
@@ -517,19 +955,47 @@ def update_motion_debug_text(
 def wait_with_static_arm(
     duration: float,
     robot_id: int,
+    arm_joint_indices: Sequence[int],
+    initial_arm_positions: dict[int, float],
+    locked_initial_positions: dict[int, float],
     client_id: int,
     camera_axis_debug_item_ids: list[int],
 ) -> bool:
-    """Advance the fixed timestep while deliberately sending no arm commands."""
-    for _ in range(round(duration / TIME_STEP)):
+    """Hold Panda with the same constrained controller used during IK motion."""
+    static_waypoint_positions = [
+        initial_arm_positions[joint_index] for joint_index in arm_joint_indices
+    ]
+    status_interval_steps = max(
+        1,
+        round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
+    )
+    for simulation_step in range(round(duration / TIME_STEP)):
         if not p.isConnected(client_id):
             return False
+        # Never leave the arm passive during the startup hold.  This uses the
+        # exact same POSITION_CONTROL gains, force and maxVelocity as MOVE;
+        # apply_constrained_arm_position_control overrides every locked target
+        # with locked_initial_positions on every physics step.
+        apply_constrained_arm_position_control(
+            robot_id,
+            arm_joint_indices,
+            static_waypoint_positions,
+            locked_initial_positions,
+            client_id,
+        )
         p.stepSimulation(physicsClientId=client_id)
         update_camera_reference_axes(
             robot_id,
             client_id,
             camera_axis_debug_item_ids,
         )
+        if (simulation_step + 1) % status_interval_steps == 0:
+            print_locked_joint_status(
+                "HOLD",
+                robot_id,
+                locked_initial_positions,
+                client_id,
+            )
         time.sleep(TIME_STEP)
     return True
 
@@ -541,13 +1007,22 @@ def move_arm_smoothly_to_ik_target(
     client_id: int,
     debug_text_id: int | None,
     camera_axis_debug_item_ids: list[int],
-) -> tuple[list[int], list[float], int, float] | None:
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+) -> tuple[list[int], list[float], int, float, float, float] | None:
     """Reach one future-Camera-origin target smoothly and hold it briefly."""
-    arm_joint_indices, joint_targets = calculate_position_only_ik(
+    arm_joint_indices, joint_targets, constrained_ik_error = calculate_constrained_position_ik(
         robot_id,
         target_position,
+        locked_joint_indices,
+        locked_initial_positions,
         client_id,
     )
+    if constrained_ik_error >= CAMERA_TARGET_ERROR_LIMIT:
+        raise RuntimeError(
+            "The selected locked-joint strategy cannot reach the Camera target "
+            f"accurately enough (constrained IK error {constrained_ik_error:.4f} m)."
+        )
     start_positions = [
         p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
         for joint_index in arm_joint_indices
@@ -555,7 +1030,7 @@ def move_arm_smoothly_to_ik_target(
     trajectory_duration = calculate_trajectory_duration(start_positions, joint_targets)
     print(f"\n=== Moving to {point_name} ===")
     print(f"Future Camera-origin target: {list(target_position)} m")
-    print("Calculated q1...q7:", [round(position, 4) for position in joint_targets])
+    print("Constrained q1...q7:", [round(position, 4) for position in joint_targets])
     print(f"Smooth trajectory duration: {trajectory_duration:.1f} s")
     debug_text_id = update_motion_debug_text(
         f"Moving to {point_name}",
@@ -566,13 +1041,14 @@ def move_arm_smoothly_to_ik_target(
     simulation_step = 0
     status_interval_steps = max(
         1,
-        round(POSITION_STATUS_INTERVAL_SECONDS / TIME_STEP),
+        round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
     )
     final_report_step = round(
         (trajectory_duration + POST_TRAJECTORY_SETTLE_SECONDS) / TIME_STEP
     )
     motion_complete_step = round(trajectory_duration / TIME_STEP)
     motion_duration_printed = False
+    max_locked_deviation = 0.0
     while p.isConnected(client_id):
         elapsed_time = simulation_step * TIME_STEP
         interpolation = _smoothstep(elapsed_time / trajectory_duration)
@@ -582,10 +1058,11 @@ def move_arm_smoothly_to_ik_target(
         ]
         # This is the only motor command for this motion.  It contains only
         # the seven Panda revolute arm joints; no gripper joint is touched.
-        apply_arm_position_control(
+        apply_constrained_arm_position_control(
             robot_id,
             arm_joint_indices,
             waypoint_positions,
+            locked_initial_positions,
             client_id,
         )
         p.stepSimulation(physicsClientId=client_id)
@@ -607,6 +1084,25 @@ def move_arm_smoothly_to_ik_target(
                 ),
                 point_name=point_name,
             )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                print_locked_joint_status(
+                    "MOVE",
+                    robot_id,
+                    locked_initial_positions,
+                    client_id,
+                ),
+            )
+        else:
+            deviations = get_locked_joint_deviations(
+                robot_id,
+                locked_initial_positions,
+                client_id,
+            )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                max((abs(deviation) for deviation in deviations.values()), default=0.0),
+            )
         if not motion_duration_printed and simulation_step >= motion_complete_step:
             debug_text_id = update_motion_debug_text(
                 f"Reached {point_name}",
@@ -619,13 +1115,19 @@ def move_arm_smoothly_to_ik_target(
             )
             motion_duration_printed = True
         if simulation_step >= final_report_step:
-            print_position_verification(
+            final_camera_error = print_position_verification(
                 target_position,
                 robot_id,
                 client_id,
                 label=f"{point_name} Final Position Result:",
                 point_name=point_name,
             )
+            print(f"Locked joint max deviation: {max_locked_deviation:.6f} rad")
+            if (
+                final_camera_error >= CAMERA_TARGET_ERROR_LIMIT
+                or max_locked_deviation >= LOCKED_JOINT_DEVIATION_LIMIT
+            ):
+                print("Warning: final constrained-motion acceptance criteria were not met.")
             print(
                 f"{point_name} held for {POST_TRAJECTORY_SETTLE_SECONDS:.1f} s; "
                 "segment complete."
@@ -635,6 +1137,8 @@ def move_arm_smoothly_to_ik_target(
                 joint_targets,
                 debug_text_id,
                 motion_complete_step * TIME_STEP,
+                final_camera_error,
+                max_locked_deviation,
             )
         time.sleep(TIME_STEP)
 
@@ -644,7 +1148,7 @@ def move_arm_smoothly_to_ik_target(
 def run_position_ik_gui_example(
     target_sequence: Sequence[tuple[str, Sequence[float]]],
 ) -> None:
-    """Move Panda through a sequence of position-only IK targets.
+    """Move Panda to one Camera-origin target with an auto-selected lock plan.
 
     No target orientation is passed to ``calculateInverseKinematics``.  The
     solver therefore computes only a position solution.  Its q1...q7 solution
@@ -652,6 +1156,28 @@ def run_position_ik_gui_example(
     simulation loop to Panda's seven revolute arm joints using
     ``POSITION_CONTROL``.
     """
+    if len(target_sequence) != 1:
+        raise ValueError("This constrained Stage 3 check accepts exactly one target point.")
+
+    target_name, target_position = target_sequence[0]
+    evaluations = [
+        evaluate_locking_strategy(strategy_name, locked_joint_names, target_position)
+        for strategy_name, locked_joint_names in LOCKING_STRATEGIES
+    ]
+    print_locking_strategy_comparison(evaluations)
+    selected_strategy = choose_locking_strategy(evaluations)
+    if selected_strategy is None:
+        print(
+            "No locking strategy met both the Camera-target and locked-joint "
+            "acceptance criteria. GUI motion will not be started."
+        )
+        return
+    print(
+        f"\nSelected strategy {selected_strategy.name}: "
+        f"lock {list(selected_strategy.locked_joint_names)}, "
+        f"active {list(selected_strategy.active_joint_names)}"
+    )
+
     client_id = p.connect(p.GUI)
     if client_id < 0:
         raise RuntimeError("Unable to open the PyBullet GUI.")
@@ -682,6 +1208,17 @@ def run_position_ik_gui_example(
             )
 
         print_camera_reference_inspection(robot_id, client_id)
+        initial_arm_positions = print_panda_arm_joint_configuration(robot_id, client_id)
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+        locked_joint_indices = [
+            arm_joint_names[joint_name]
+            for joint_name in selected_strategy.locked_joint_names
+        ]
+        locked_initial_positions = {
+            joint_index: initial_arm_positions[joint_index]
+            for joint_index in locked_joint_indices
+        }
         print("Close the PyBullet GUI window to finish the example.")
 
         add_target_markers(target_sequence, client_id)
@@ -696,6 +1233,9 @@ def run_position_ik_gui_example(
         if not wait_with_static_arm(
             STARTUP_PAUSE_SECONDS,
             robot_id,
+            arm_joint_indices,
+            initial_arm_positions,
+            locked_initial_positions,
             client_id,
             camera_axis_debug_item_ids,
         ):
@@ -703,39 +1243,45 @@ def run_position_ik_gui_example(
 
         final_arm_joint_indices: list[int] | None = None
         final_joint_targets: list[float] | None = None
-        motion_durations: list[tuple[str, float]] = []
-        for point_name, target_position in target_sequence:
-            result = move_arm_smoothly_to_ik_target(
-                robot_id,
-                point_name,
-                target_position,
-                client_id,
-                debug_text_id,
-                camera_axis_debug_item_ids,
-            )
-            if result is None:
-                return
-            (
-                final_arm_joint_indices,
-                final_joint_targets,
-                debug_text_id,
-                motion_duration,
-            ) = result
-            motion_durations.append((point_name, motion_duration))
+        result = move_arm_smoothly_to_ik_target(
+            robot_id,
+            target_name,
+            target_position,
+            client_id,
+            debug_text_id,
+            camera_axis_debug_item_ids,
+            locked_joint_indices,
+            locked_initial_positions,
+        )
+        if result is None:
+            return
+        (
+            final_arm_joint_indices,
+            final_joint_targets,
+            debug_text_id,
+            motion_duration,
+            final_camera_error,
+            max_locked_deviation,
+        ) = result
 
         if final_arm_joint_indices is None or final_joint_targets is None:
             raise RuntimeError("The IK target sequence must contain at least one point.")
 
-        sequence_name = " -> ".join(point_name for point_name, _ in target_sequence)
-        print(f"\n{sequence_name} sequence complete. Holding the final position.")
-        print("Actual motion durations:")
-        for point_name, motion_duration in motion_durations:
-            print(f"  {point_name}: {motion_duration:.2f} s")
+        print(f"\n{target_name} constrained motion complete. Holding the final position.")
+        print(f"Actual motion duration: {motion_duration:.2f} s")
+        print(f"Final camera position error: {final_camera_error:.4f} m")
+        print(f"Locked joint max deviation: {max_locked_deviation:.6f} rad")
+        final_hold_step = 0
+        final_hold_status_interval_steps = max(
+            1,
+            round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
+        )
         while p.isConnected(client_id):
-            apply_arm_position_control(
+            apply_constrained_arm_position_control(
                 robot_id,
                 final_arm_joint_indices,
                 final_joint_targets,
+                locked_initial_positions,
                 client_id,
             )
             p.stepSimulation(physicsClientId=client_id)
@@ -744,6 +1290,14 @@ def run_position_ik_gui_example(
                 client_id,
                 camera_axis_debug_item_ids,
             )
+            final_hold_step += 1
+            if final_hold_step % final_hold_status_interval_steps == 0:
+                print_locked_joint_status(
+                    "HOLD",
+                    robot_id,
+                    locked_initial_positions,
+                    client_id,
+                )
             time.sleep(TIME_STEP)
     finally:
         if p.isConnected(client_id):
