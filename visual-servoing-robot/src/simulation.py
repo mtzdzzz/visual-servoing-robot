@@ -19,6 +19,7 @@ from camera_observation import (
     CAMERA_OFFSET_DEBUG_OUTPUT_PATH,
     STAGE4_FINAL_RGB_OUTPUT_PATH,
     STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
+    EyeInHandRgbDisplay,
     add_camera_diagnostic_debug_lines,
     capture_eye_in_hand_rgb,
     capture_forced_look_at_rgb,
@@ -27,6 +28,7 @@ from camera_observation import (
     print_camera_observation,
     print_camera_render_diagnostics,
     print_camera_target_alignment,
+    render_live_eye_in_hand_rgb_frame,
 )
 
 
@@ -46,6 +48,11 @@ MAX_JOINT_VELOCITY = 0.06  # radians/second; reaches the target in about 5 secon
 POSITION_GAIN = 0.03
 MAX_MOTOR_FORCE = 5.0
 TIME_STEP = 1.0 / 240.0
+CAMERA_DISPLAY_FREQUENCY_HZ = 20.0
+CAMERA_UPDATE_INTERVAL_STEPS = max(
+    1,
+    round(1.0 / (TIME_STEP * CAMERA_DISPLAY_FREQUENCY_HZ)),
+)
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -1250,6 +1257,34 @@ def update_camera_reference_axes(
     debug_item_ids[:] = new_debug_item_ids
 
 
+def update_live_eye_in_hand_camera(
+    robot_id: int,
+    simulation_step: int,
+    client_id: int,
+    camera_display: EyeInHandRgbDisplay,
+) -> None:
+    """Refresh the fixed hand-eye RGB camera from the latest E pose.
+
+    This function is called after every physics step in both HOLD and MOVE.
+    It always reads ``getLinkState`` through ``get_camera_optical_center_pose``
+    to obtain current T_W_E(t) and composes T_W_C(t) = T_W_E(t) @ T_E_C.
+    Rendering and display are intentionally rate-limited to 20 Hz so the
+    240 Hz simulation/control loop remains stable.
+    """
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    if simulation_step % CAMERA_UPDATE_INTERVAL_STEPS != 0:
+        return
+    live_frame = render_live_eye_in_hand_rgb_frame(
+        camera_position,
+        camera_orientation,
+        client_id,
+    )
+    camera_display.show(live_frame)
+
+
 def update_motion_debug_text(
     text: str,
     previous_text_id: int | None,
@@ -1276,6 +1311,7 @@ def wait_with_static_arm(
     locked_initial_positions: dict[int, float],
     client_id: int,
     camera_axis_debug_item_ids: list[int],
+    camera_display: EyeInHandRgbDisplay,
 ) -> bool:
     """Hold Panda with the same constrained controller used during IK motion."""
     static_waypoint_positions = [
@@ -1305,6 +1341,12 @@ def wait_with_static_arm(
             client_id,
             camera_axis_debug_item_ids,
         )
+        update_live_eye_in_hand_camera(
+            robot_id,
+            simulation_step,
+            client_id,
+            camera_display,
+        )
         if (simulation_step + 1) % status_interval_steps == 0:
             print_locked_joint_status(
                 "HOLD",
@@ -1325,6 +1367,7 @@ def move_arm_smoothly_to_ik_target(
     camera_axis_debug_item_ids: list[int],
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
+    camera_display: EyeInHandRgbDisplay,
 ) -> tuple[list[int], list[float], int, float, float, float] | None:
     """Reach one unchanged Stage 3.1 IK-reference target and hold briefly."""
     arm_joint_indices, joint_targets, constrained_ik_error = calculate_constrained_position_ik(
@@ -1386,6 +1429,12 @@ def move_arm_smoothly_to_ik_target(
             robot_id,
             client_id,
             camera_axis_debug_item_ids,
+        )
+        update_live_eye_in_hand_camera(
+            robot_id,
+            simulation_step,
+            client_id,
+            camera_display,
         )
         simulation_step += 1
 
@@ -1498,6 +1547,7 @@ def run_position_ik_gui_example(
     if client_id < 0:
         raise RuntimeError("Unable to open the PyBullet GUI.")
 
+    camera_display: EyeInHandRgbDisplay | None = None
     try:
         p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
         p.setGravity(0, 0, 0, physicsClientId=client_id)
@@ -1576,6 +1626,13 @@ def run_position_ik_gui_example(
             client_id,
         )
 
+        camera_display = EyeInHandRgbDisplay()
+        print(
+            "Live Eye-in-Hand RGB refresh: "
+            f"{CAMERA_DISPLAY_FREQUENCY_HZ:.0f} Hz "
+            f"(every {CAMERA_UPDATE_INTERVAL_STEPS} simulation steps)."
+        )
+
         add_target_markers(target_sequence, client_id)
         camera_axis_debug_item_ids: list[int] = []
         update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
@@ -1593,6 +1650,7 @@ def run_position_ik_gui_example(
             locked_initial_positions,
             client_id,
             camera_axis_debug_item_ids,
+            camera_display,
         ):
             return
 
@@ -1607,6 +1665,7 @@ def run_position_ik_gui_example(
             camera_axis_debug_item_ids,
             locked_joint_indices,
             locked_initial_positions,
+            camera_display,
         )
         if result is None:
             return
@@ -1698,6 +1757,7 @@ def run_position_ik_gui_example(
             camera_axis_debug_item_ids,
             locked_joint_indices,
             locked_initial_positions,
+            camera_display,
         )
         if secondary_result is None:
             return
@@ -1771,6 +1831,12 @@ def run_position_ik_gui_example(
                 client_id,
                 camera_axis_debug_item_ids,
             )
+            update_live_eye_in_hand_camera(
+                robot_id,
+                final_hold_step,
+                client_id,
+                camera_display,
+            )
             final_hold_step += 1
             if final_hold_step % final_hold_status_interval_steps == 0:
                 print_locked_joint_status(
@@ -1781,6 +1847,8 @@ def run_position_ik_gui_example(
                 )
             time.sleep(TIME_STEP)
     finally:
+        if camera_display is not None:
+            camera_display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
 

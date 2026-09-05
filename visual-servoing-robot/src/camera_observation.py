@@ -96,6 +96,19 @@ class CameraObservation:
     image_path: Path
 
 
+@dataclass(frozen=True)
+class LiveCameraFrame:
+    """One unsaved RGB frame rendered from the current fixed camera pose."""
+
+    camera_world_position: tuple[float, float, float]
+    camera_world_orientation: tuple[float, float, float, float]
+    optical_axis_world: tuple[float, float, float]
+    render_parameters: CameraRenderParameters
+    image_width: int
+    image_height: int
+    rgba_buffer: object
+
+
 def create_red_ground_target(client_id: int) -> tuple[int, list[float]]:
     """Create a static red sphere resting on the z=0 ground plane."""
     collision_shape_id = p.createCollisionShape(
@@ -327,6 +340,126 @@ def _render_with_parameters(
         physicsClientId=client_id,
     )
     return image_width, image_height, rgba_buffer, segmentation_buffer
+
+
+def render_live_eye_in_hand_rgb_frame(
+    camera_reference_world_position: Sequence[float],
+    camera_reference_world_orientation: Sequence[float],
+    client_id: int,
+) -> LiveCameraFrame:
+    """Render one normal fixed-mount camera frame without any target look-at.
+
+    The supplied pose is the current physical C pose.  The view target is
+    constructed only from C's fixed optical axis, never from the red target:
+    ``target = eye + R_W_C @ [0, 0, 1]``.
+    """
+    (
+        camera_world_position,
+        camera_world_orientation,
+        _,
+        camera_y_axis_world,
+        optical_axis_world,
+    ) = get_rigid_camera_pose(
+        camera_reference_world_position,
+        camera_reference_world_orientation,
+    )
+    render_parameters = build_camera_render_parameters(
+        camera_world_position,
+        [
+            position + direction
+            for position, direction in zip(camera_world_position, optical_axis_world)
+        ],
+        camera_y_axis_world,
+    )
+    image_width, image_height, rgba_buffer, _ = _render_with_parameters(
+        render_parameters,
+        client_id,
+    )
+    return LiveCameraFrame(
+        camera_world_position=tuple(camera_world_position),
+        camera_world_orientation=tuple(camera_world_orientation),
+        optical_axis_world=tuple(optical_axis_world),
+        render_parameters=render_parameters,
+        image_width=image_width,
+        image_height=image_height,
+        rgba_buffer=rgba_buffer,
+    )
+
+
+class EyeInHandRgbDisplay:
+    """A lightweight, non-blocking Tkinter viewer for live PyBullet RGB frames."""
+
+    def __init__(self, title: str = "Eye-in-Hand RGB") -> None:
+        self._root: object | None = None
+        self._label: object | None = None
+        self._tk: object | None = None
+        self._closed = False
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.title(title)
+            root.resizable(False, False)
+            label = tk.Label(root)
+            label.pack()
+            root.protocol("WM_DELETE_WINDOW", self.close)
+            self._root = root
+            self._label = label
+            self._tk = tk
+            root.update_idletasks()
+            root.update()
+            print(f"Opened real-time {title!r} display (Tkinter).")
+        except Exception as error:  # GUI availability is platform-dependent.
+            self._closed = True
+            print(f"Live Eye-in-Hand RGB display unavailable: {error}")
+
+    @property
+    def is_open(self) -> bool:
+        return not self._closed and self._root is not None
+
+    def close(self) -> None:
+        """Close the viewer without altering the PyBullet simulation."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._root is not None:
+            try:
+                self._root.destroy()  # type: ignore[union-attr]
+            except Exception:
+                pass
+        self._root = None
+        self._label = None
+
+    def show(self, frame: LiveCameraFrame) -> None:
+        """Display one RGBA PyBullet frame as an RGB image without saving it."""
+        if not self.is_open or self._root is None or self._label is None or self._tk is None:
+            return
+        try:
+            rgba_bytes = _rgba_buffer_to_bytes(frame.rgba_buffer)
+            expected_byte_count = frame.image_width * frame.image_height * 4
+            if len(rgba_bytes) != expected_byte_count:
+                raise RuntimeError(
+                    "PyBullet returned an unexpected live RGBA buffer length: "
+                    f"expected {expected_byte_count}, got {len(rgba_bytes)}."
+                )
+            rgb_bytes = bytearray(frame.image_width * frame.image_height * 3)
+            source_index = 0
+            destination_index = 0
+            for _ in range(frame.image_width * frame.image_height):
+                rgb_bytes[destination_index] = rgba_bytes[source_index]
+                rgb_bytes[destination_index + 1] = rgba_bytes[source_index + 1]
+                rgb_bytes[destination_index + 2] = rgba_bytes[source_index + 2]
+                source_index += 4
+                destination_index += 3
+            ppm_header = f"P6\n{frame.image_width} {frame.image_height}\n255\n".encode("ascii")
+            image = self._tk.PhotoImage(data=ppm_header + bytes(rgb_bytes), format="PPM")
+            self._label.configure(image=image)
+            self._label.image = image
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception as error:
+            print(f"Live Eye-in-Hand RGB display stopped: {error}")
+            self.close()
 
 
 def add_camera_viewing_direction_debug_line(
