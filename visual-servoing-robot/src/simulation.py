@@ -1,20 +1,33 @@
-"""Inspect a Panda arm or run safe PyBullet motion demonstrations.
+"""Inspect a Panda arm, run safe motion, and render a PyBullet RGB preview.
 
-This module is intentionally limited to robot loading and inspection.  It does
-not create a camera or implement perception, visual servoing, PID, ROS, or
-Gazebo integration.
+The RGB preview is observation-only.  It does not implement image detection,
+visual servoing, PID, ROS, Gazebo, or YOLO.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from math import sqrt
+from math import acos, degrees, radians, sqrt
 import time
 from typing import Sequence
 
 import pybullet as p
 import pybullet_data
+
+from camera_observation import (
+    CAMERA_OFFSET_DEBUG_OUTPUT_PATH,
+    STAGE4_FINAL_RGB_OUTPUT_PATH,
+    STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
+    add_camera_diagnostic_debug_lines,
+    capture_eye_in_hand_rgb,
+    capture_forced_look_at_rgb,
+    create_red_ground_target,
+    print_camera_coordinate_definition,
+    print_camera_observation,
+    print_camera_render_diagnostics,
+    print_camera_target_alignment,
+)
 
 
 JOINT_TYPE_NAMES = {
@@ -40,19 +53,45 @@ TIME_STEP = 1.0 / 240.0
 END_EFFECTOR_LINK_INDEX = 7
 END_EFFECTOR_LINK_NAME = "panda_link8"
 CAMERA_REFERENCE_FRAME_NAME = "C"
-# MVP camera-reference transform.  The virtual camera origin C coincides with
-# the selected end-effector frame E: T_E_C = Identity.
-T_E_C_POSITION = (0.0, 0.0, 0.0)
-T_E_C_ORIENTATION = (0.0, 0.0, 0.0, 1.0)
-# A tested upper-arm-workspace position for the future camera origin C, in metres.
+# Stage 3.1's position-IK reference remains at E exactly as validated.  It is
+# deliberately separate from the physical camera optical center below, so the
+# camera mounting investigation cannot change the accepted robot trajectory.
+T_E_IK_REFERENCE_POSITION = (0.0, 0.0, 0.0)
+T_E_IK_REFERENCE_ORIENTATION = (0.0, 0.0, 0.0, 1.0)
+
+# Temporary physical Eye-in-Hand camera mounting transform.  Panda's hand and
+# fingers extend along E's local +Z axis, while E is within the hand collision
+# geometry.  Clearance tests selected the exterior side direction +Y_E at
+# 0.10 m.  This is a local E-frame translation, not a world-axis assumption.
+T_E_C_POSITION = (0.0, 0.10, 0.0)
+# This manually selected, fixed hand-eye rotation faces the ground work area
+# from the startup pose and remains unchanged at every later pose.  It is not
+# calculated from the red target position and no look-at operation is used.
+T_E_C_ROTATION_RPY_DEGREES = (0.0, -15.0, -20.0)
+T_E_C_ORIENTATION = p.getQuaternionFromEuler(
+    tuple(radians(angle) for angle in T_E_C_ROTATION_RPY_DEGREES)
+)
+CAMERA_CLEARANCE_PROBE_RADIUS = 0.01  # metres; diagnostic only, not rendered
+
+# A tested upper-arm-workspace position for the existing Stage 3.1 IK
+# reference, in metres.  It is intentionally not changed by the camera mount.
 SAFE_CAMERA_ORIGIN_TARGET_POSITION = (0.09, -0.09, 1.08)
 DEFAULT_CAMERA_REFERENCE_TARGET_SEQUENCE = (
     ("Camera Origin Test", SAFE_CAMERA_ORIGIN_TARGET_POSITION),
 )
+SECONDARY_CAMERA_REFERENCE_TARGET = (
+    "Small Camera-Follow Check",
+    (0.092, -0.092, 1.078),
+)
 LOCKING_STRATEGIES = (
     (
         "A",
-        ("panda_joint1", "panda_joint2", "panda_joint3"),
+        (
+            "panda_joint1",
+            "panda_joint2",
+            "panda_joint3",
+            "panda_joint4",
+        ),
     ),
 )
 LOCKED_JOINT_DEVIATION_LIMIT = 0.005  # radians
@@ -276,7 +315,31 @@ def get_camera_reference_pose(
     robot_id: int,
     client_id: int,
 ) -> tuple[list[float], list[float]]:
-    """Compose the world pose of C from E and the fixed transform T_E_C."""
+    """Return the unchanged Stage 3.1 position-IK reference at E.
+
+    This function remains the reference used by the accepted constrained-IK
+    controller.  The physical optical center C is intentionally calculated by
+    ``get_camera_optical_center_pose`` so camera mounting work cannot alter
+    the robot control baseline.
+    """
+    end_effector_position, end_effector_orientation = get_end_effector_reference_pose(
+        robot_id,
+        client_id,
+    )
+    ik_reference_position, ik_reference_orientation = p.multiplyTransforms(
+        end_effector_position,
+        end_effector_orientation,
+        T_E_IK_REFERENCE_POSITION,
+        T_E_IK_REFERENCE_ORIENTATION,
+    )
+    return list(ik_reference_position), list(ik_reference_orientation)
+
+
+def get_camera_optical_center_pose(
+    robot_id: int,
+    client_id: int,
+) -> tuple[list[float], list[float]]:
+    """Compose the physical camera optical-center C pose from E and T_E_C."""
     end_effector_position, end_effector_orientation = get_end_effector_reference_pose(
         robot_id,
         client_id,
@@ -288,6 +351,81 @@ def get_camera_reference_pose(
         T_E_C_ORIENTATION,
     )
     return list(camera_position), list(camera_orientation)
+
+
+def get_measured_hand_eye_transform(
+    robot_id: int,
+    client_id: int,
+) -> tuple[list[float], list[float]]:
+    """Recover T_E_C from current world poses for a rigid-mount audit."""
+    end_effector_position, end_effector_orientation = get_end_effector_reference_pose(
+        robot_id,
+        client_id,
+    )
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    inverse_end_effector_position, inverse_end_effector_orientation = p.invertTransform(
+        end_effector_position,
+        end_effector_orientation,
+    )
+    measured_translation, measured_orientation = p.multiplyTransforms(
+        inverse_end_effector_position,
+        inverse_end_effector_orientation,
+        camera_position,
+        camera_orientation,
+    )
+    return list(measured_translation), list(measured_orientation)
+
+
+def _quaternion_distance_degrees(
+    first_orientation: Sequence[float],
+    second_orientation: Sequence[float],
+) -> float:
+    """Return the smallest angle between two unit quaternions in degrees."""
+    absolute_dot = abs(
+        sum(first * second for first, second in zip(first_orientation, second_orientation))
+    )
+    return degrees(2.0 * acos(max(-1.0, min(1.0, absolute_dot))))
+
+
+def print_hand_eye_transform_validation(
+    label: str,
+    measured_transform: tuple[Sequence[float], Sequence[float]],
+    comparison_transform: tuple[Sequence[float], Sequence[float]] | None = None,
+) -> None:
+    """Print the fixed mount transform and, optionally, a second-pose delta."""
+    measured_translation, measured_orientation = measured_transform
+    translation_error = sqrt(
+        sum(
+            (measured - configured) ** 2
+            for measured, configured in zip(measured_translation, T_E_C_POSITION)
+        )
+    )
+    rotation_error = _quaternion_distance_degrees(
+        measured_orientation,
+        T_E_C_ORIENTATION,
+    )
+    print(f"\n{label} hand-eye transform validation:")
+    print("  measured T_E_C translation:", [round(value, 6) for value in measured_translation])
+    print("  measured T_E_C rotation xyzw:", [round(value, 6) for value in measured_orientation])
+    print(f"  configured translation error: {translation_error:.8f} m")
+    print(f"  configured rotation error: {rotation_error:.8f} deg")
+    if comparison_transform is not None:
+        comparison_translation, comparison_orientation = comparison_transform
+        pose_translation_delta = sqrt(
+            sum(
+                (measured - comparison) ** 2
+                for measured, comparison in zip(measured_translation, comparison_translation)
+            )
+        )
+        pose_rotation_delta = _quaternion_distance_degrees(
+            measured_orientation,
+            comparison_orientation,
+        )
+        print(f"  two-pose T_E_C translation delta: {pose_translation_delta:.8f} m")
+        print(f"  two-pose T_E_C rotation delta: {pose_rotation_delta:.8f} deg")
 
 
 def print_camera_reference_inspection(robot_id: int, client_id: int) -> None:
@@ -318,13 +456,131 @@ def print_camera_reference_inspection(robot_id: int, client_id: int) -> None:
     print(f"  link name: {END_EFFECTOR_LINK_NAME}")
     print("  world position:", [round(value, 4) for value in end_effector_position])
     print("  world orientation xyzw:", [round(value, 4) for value in end_effector_orientation])
-    camera_position, camera_orientation = get_camera_reference_pose(robot_id, client_id)
+    ik_reference_position, _ = get_camera_reference_pose(robot_id, client_id)
+    camera_position, camera_orientation = get_camera_optical_center_pose(robot_id, client_id)
     print(
-        "Camera reference C MVP: T_E_C = Identity "
-        f"(translation={list(T_E_C_POSITION)}, orientation={list(T_E_C_ORIENTATION)})."
+        "Stage 3.1 IK reference remains at E "
+        f"(translation={list(T_E_IK_REFERENCE_POSITION)}):",
+        [round(value, 4) for value in ik_reference_position],
+    )
+    print(
+        "Physical camera optical center C: "
+        f"T_E_C translation={list(T_E_C_POSITION)}, "
+        "rotation RPY degrees="
+        f"{list(T_E_C_ROTATION_RPY_DEGREES)}, "
+        f"orientation xyzw={list(T_E_C_ORIENTATION)}"
     )
     print("  C world position:", [round(value, 4) for value in camera_position])
     print("  C world orientation xyzw:", [round(value, 4) for value in camera_orientation])
+
+
+def _link_name_for_debug(robot_id: int, link_index: int, client_id: int) -> str:
+    """Return a readable link name, including PyBullet's base pseudo-link."""
+    if link_index == -1:
+        return "base"
+    return _decode_name(
+        p.getJointInfo(robot_id, link_index, physicsClientId=client_id)[12]
+    )
+
+
+def print_camera_mount_geometry_inspection(
+    robot_id: int,
+    target_world_position: Sequence[float],
+    client_id: int,
+) -> None:
+    """Inspect E/C against the loaded wrist and hand geometry without motors.
+
+    A 1 cm collision-only sphere is momentarily placed at C to measure signed
+    clearance from the actual Panda collision meshes.  It is removed before
+    returning and never participates in physics stepping or motor control.
+    """
+    end_effector_position, _ = get_end_effector_reference_pose(robot_id, client_id)
+    camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+    hand_link_index = get_link_index_by_name(robot_id, "panda_hand", client_id)
+
+    print("\nCamera mount / Panda geometry inspection:")
+    print("E world position:", [round(value, 6) for value in end_effector_position])
+    print("C world position:", [round(value, 6) for value in camera_position])
+    print("T_E_C translation:", [round(value, 6) for value in T_E_C_POSITION])
+    print(
+        "distance(E, C): "
+        f"{sqrt(sum((camera - end) ** 2 for camera, end in zip(camera_position, end_effector_position))):.6f} m"
+    )
+    print(
+        "camera-to-target distance: "
+        f"{sqrt(sum((target - camera) ** 2 for target, camera in zip(target_world_position, camera_position))):.6f} m"
+    )
+
+    for link_index in (END_EFFECTOR_LINK_INDEX, hand_link_index):
+        link_name = _link_name_for_debug(robot_id, link_index, client_id)
+        aabb_min, aabb_max = p.getAABB(
+            robot_id,
+            link_index,
+            physicsClientId=client_id,
+        )
+        print(
+            f"  {link_name} (link {link_index}) world collision AABB:",
+            "min=",
+            [round(value, 4) for value in aabb_min],
+            "max=",
+            [round(value, 4) for value in aabb_max],
+        )
+        visual_shapes = [
+            shape
+            for shape in p.getVisualShapeData(robot_id, physicsClientId=client_id)
+            if shape[1] == link_index
+        ]
+        collision_shapes = p.getCollisionShapeData(
+            robot_id,
+            link_index,
+            physicsClientId=client_id,
+        )
+        print(
+            f"    visual shapes={len(visual_shapes)}, collision shapes={len(collision_shapes)}"
+        )
+        for collision_shape in collision_shapes:
+            print(
+                "    collision local position:",
+                [round(value, 4) for value in collision_shape[5]],
+                "asset:",
+                _decode_name(collision_shape[4]),
+            )
+
+    probe_shape_id = p.createCollisionShape(
+        p.GEOM_SPHERE,
+        radius=CAMERA_CLEARANCE_PROBE_RADIUS,
+        physicsClientId=client_id,
+    )
+    probe_body_id = p.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=probe_shape_id,
+        basePosition=camera_position,
+        physicsClientId=client_id,
+    )
+    try:
+        closest_points = p.getClosestPoints(
+            robot_id,
+            probe_body_id,
+            distance=0.5,
+            physicsClientId=client_id,
+        )
+        if not closest_points:
+            print("  C clearance probe: no Panda geometry found within 0.5 m.")
+            return
+        nearest_point = min(closest_points, key=lambda point: point[8])
+        signed_surface_distance = nearest_point[8]
+        nearest_link_index = nearest_point[3]
+        print(
+            "  C 1-cm probe signed clearance to Panda: "
+            f"{signed_surface_distance:.6f} m "
+            f"(nearest {_link_name_for_debug(robot_id, nearest_link_index, client_id)})."
+        )
+        print(
+            "  C outside Panda collision geometry: "
+            f"{signed_surface_distance >= 0.0}"
+        )
+    finally:
+        p.removeBody(probe_body_id, physicsClientId=client_id)
 
 
 def calculate_position_only_ik(
@@ -812,9 +1068,9 @@ def choose_locking_strategy(
 
 
 def get_end_effector_position(robot_id: int, client_id: int) -> list[float]:
-    """Read the current future-Camera-origin world position from PyBullet."""
-    camera_position, _ = get_camera_reference_pose(robot_id, client_id)
-    return camera_position
+    """Read the unchanged Stage 3.1 IK reference world position at E."""
+    ik_reference_position, _ = get_camera_reference_pose(robot_id, client_id)
+    return ik_reference_position
 
 
 def print_position_verification(
@@ -879,25 +1135,40 @@ def update_camera_reference_axes(
     client_id: int,
     debug_item_ids: list[int],
 ) -> None:
-    """Draw the moving Camera-reference C axes from the current E-frame pose."""
-    camera_position, camera_orientation = get_camera_reference_pose(robot_id, client_id)
+    """Draw distinct E and physical-camera-C frames plus their mount offset.
+
+    This is GUI-only visualization.  The existing callers execute it during
+    HOLD and MOVE, but this function never sends an IK or motor command.
+    """
+    end_effector_position, end_effector_orientation = get_end_effector_reference_pose(
+        robot_id,
+        client_id,
+    )
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
     axis_definitions = (
         ((CAMERA_AXIS_LENGTH, 0.0, 0.0), [1.0, 0.0, 0.0]),  # X: red
         ((0.0, CAMERA_AXIS_LENGTH, 0.0), [0.0, 1.0, 0.0]),  # Y: green
         ((0.0, 0.0, CAMERA_AXIS_LENGTH), [0.0, 0.0, 1.0]),  # Z: blue
     )
-    new_debug_item_ids = []
+    new_debug_item_ids: list[int] = []
+
+    def replacement_id(index: int) -> int:
+        return (
+            debug_item_ids[index]
+            if index < len(debug_item_ids) and debug_item_ids[index] >= 0
+            else -1
+        )
+
+    # Physical camera optical-center C axes.
     for axis_index, (axis_end_in_camera, color) in enumerate(axis_definitions):
         axis_end_world, _ = p.multiplyTransforms(
             camera_position,
             camera_orientation,
             axis_end_in_camera,
             (0.0, 0.0, 0.0, 1.0),
-        )
-        replace_item_id = (
-            debug_item_ids[axis_index]
-            if axis_index < len(debug_item_ids) and debug_item_ids[axis_index] >= 0
-            else -1
         )
         new_debug_item_ids.append(
             p.addUserDebugLine(
@@ -906,7 +1177,7 @@ def update_camera_reference_axes(
                 lineColorRGB=color,
                 lineWidth=4,
                 lifeTime=0,
-                replaceItemUniqueId=replace_item_id,
+                replaceItemUniqueId=replacement_id(axis_index),
                 physicsClientId=client_id,
             )
         )
@@ -917,17 +1188,62 @@ def update_camera_reference_axes(
         (0.0, 0.0, CAMERA_AXIS_LENGTH * 1.25),
         (0.0, 0.0, 0.0, 1.0),
     )
-    replace_label_id = (
-        debug_item_ids[3] if len(debug_item_ids) > 3 and debug_item_ids[3] >= 0 else -1
-    )
     new_debug_item_ids.append(
         p.addUserDebugText(
-            f"Camera Reference {CAMERA_REFERENCE_FRAME_NAME} (T_E_C = I)",
+            f"Camera optical center {CAMERA_REFERENCE_FRAME_NAME}",
             label_position,
             textColorRGB=[1.0, 1.0, 1.0],
             textSize=1.2,
             lifeTime=0,
-            replaceItemUniqueId=replace_label_id,
+            replaceItemUniqueId=replacement_id(3),
+            physicsClientId=client_id,
+        )
+    )
+
+    # E remains marked separately at its original panda_link8 frame origin.
+    for axis_index, (axis_end_in_end_effector, color) in enumerate(axis_definitions):
+        axis_end_world, _ = p.multiplyTransforms(
+            end_effector_position,
+            end_effector_orientation,
+            tuple(component * 0.65 for component in axis_end_in_end_effector),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        new_debug_item_ids.append(
+            p.addUserDebugLine(
+                end_effector_position,
+                axis_end_world,
+                lineColorRGB=color,
+                lineWidth=3,
+                lifeTime=0,
+                replaceItemUniqueId=replacement_id(4 + axis_index),
+                physicsClientId=client_id,
+            )
+        )
+    end_effector_label_position, _ = p.multiplyTransforms(
+        end_effector_position,
+        end_effector_orientation,
+        (0.0, 0.0, CAMERA_AXIS_LENGTH * 0.8),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+    new_debug_item_ids.append(
+        p.addUserDebugText(
+            f"E: {END_EFFECTOR_LINK_NAME}",
+            end_effector_label_position,
+            textColorRGB=[1.0, 0.2, 1.0],
+            textSize=1.2,
+            lifeTime=0,
+            replaceItemUniqueId=replacement_id(7),
+            physicsClientId=client_id,
+        )
+    )
+    new_debug_item_ids.append(
+        p.addUserDebugLine(
+            end_effector_position,
+            camera_position,
+            lineColorRGB=[1.0, 0.2, 1.0],
+            lineWidth=4,
+            lifeTime=0,
+            replaceItemUniqueId=replacement_id(8),
             physicsClientId=client_id,
         )
     )
@@ -1010,7 +1326,7 @@ def move_arm_smoothly_to_ik_target(
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
 ) -> tuple[list[int], list[float], int, float, float, float] | None:
-    """Reach one future-Camera-origin target smoothly and hold it briefly."""
+    """Reach one unchanged Stage 3.1 IK-reference target and hold briefly."""
     arm_joint_indices, joint_targets, constrained_ik_error = calculate_constrained_position_ik(
         robot_id,
         target_position,
@@ -1029,7 +1345,7 @@ def move_arm_smoothly_to_ik_target(
     ]
     trajectory_duration = calculate_trajectory_duration(start_positions, joint_targets)
     print(f"\n=== Moving to {point_name} ===")
-    print(f"Future Camera-origin target: {list(target_position)} m")
+    print(f"Stage 3.1 IK-reference target: {list(target_position)} m")
     print("Constrained q1...q7:", [round(position, 4) for position in joint_targets])
     print(f"Smooth trajectory duration: {trajectory_duration:.1f} s")
     debug_text_id = update_motion_debug_text(
@@ -1148,7 +1464,7 @@ def move_arm_smoothly_to_ik_target(
 def run_position_ik_gui_example(
     target_sequence: Sequence[tuple[str, Sequence[float]]],
 ) -> None:
-    """Move Panda to one Camera-origin target with an auto-selected lock plan.
+    """Move Panda to one Stage 3.1 IK-reference target with a lock plan.
 
     No target orientation is passed to ``calculateInverseKinematics``.  The
     solver therefore computes only a position solution.  Its q1...q7 solution
@@ -1221,6 +1537,45 @@ def run_position_ik_gui_example(
         }
         print("Close the PyBullet GUI window to finish the example.")
 
+        # Observation setup only: it creates no motor command and does not
+        # change the Stage 3.1 joint-control or IK configuration.
+        red_target_id, red_target_world_position = create_red_ground_target(client_id)
+        print(
+            "Target world position:",
+            [round(value, 4) for value in red_target_world_position],
+        )
+        print_camera_coordinate_definition()
+        print_camera_mount_geometry_inspection(
+            robot_id,
+            red_target_world_position,
+            client_id,
+        )
+        startup_hand_eye_transform = get_measured_hand_eye_transform(robot_id, client_id)
+        print_hand_eye_transform_validation(
+            "Startup fixed camera",
+            startup_hand_eye_transform,
+        )
+        static_camera_reference_position, static_camera_reference_orientation = (
+            get_camera_optical_center_pose(robot_id, client_id)
+        )
+        static_observation = capture_eye_in_hand_rgb(
+            static_camera_reference_position,
+            static_camera_reference_orientation,
+            red_target_world_position,
+            red_target_id,
+            client_id,
+            STAGE4_FINAL_RGB_OUTPUT_PATH,
+        )
+        print("\nStatic-arm camera attachment check:")
+        print_camera_observation(static_observation, red_target_world_position)
+        print_camera_target_alignment(static_observation, red_target_world_position)
+        print_camera_render_diagnostics(static_observation, red_target_world_position)
+        camera_diagnostic_debug_item_ids = add_camera_diagnostic_debug_lines(
+            static_observation,
+            red_target_world_position,
+            client_id,
+        )
+
         add_target_markers(target_sequence, client_id)
         camera_axis_debug_item_ids: list[int] = []
         update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
@@ -1271,6 +1626,132 @@ def run_position_ik_gui_example(
         print(f"Actual motion duration: {motion_duration:.2f} s")
         print(f"Final camera position error: {final_camera_error:.4f} m")
         print(f"Locked joint max deviation: {max_locked_deviation:.6f} rad")
+
+        # Render once after the validated Stage 3.1 motion has completed.  The
+        # renderer reads the offset optical-center C pose but sends no joint
+        # commands and no IK request.
+        camera_reference_position, camera_reference_orientation = (
+            get_camera_optical_center_pose(robot_id, client_id)
+        )
+        print_camera_mount_geometry_inspection(
+            robot_id,
+            red_target_world_position,
+            client_id,
+        )
+        observation = capture_eye_in_hand_rgb(
+            camera_reference_position,
+            camera_reference_orientation,
+            red_target_world_position,
+            red_target_id,
+            client_id,
+        )
+        print("\nPost-motion camera attachment check:")
+        print_camera_observation(observation, red_target_world_position)
+        print_camera_target_alignment(observation, red_target_world_position)
+        print_camera_render_diagnostics(observation, red_target_world_position)
+        camera_diagnostic_debug_item_ids = add_camera_diagnostic_debug_lines(
+            observation,
+            red_target_world_position,
+            client_id,
+            camera_diagnostic_debug_item_ids,
+        )
+        if observation.target_visible_pixel_count == 0:
+            raise RuntimeError(
+                "The red target was not visible in the RGB preview; "
+                "the camera-observation check did not pass."
+            )
+        forced_look_at_observation = capture_forced_look_at_rgb(
+            camera_reference_position,
+            camera_reference_orientation,
+            red_target_world_position,
+            red_target_id,
+            client_id,
+            CAMERA_OFFSET_DEBUG_OUTPUT_PATH,
+        )
+        print("\nForced look-at camera diagnostic (no Panda pose change):")
+        print_camera_observation(forced_look_at_observation, red_target_world_position)
+        print_camera_render_diagnostics(
+            forced_look_at_observation,
+            red_target_world_position,
+        )
+        camera_diagnostic_debug_item_ids = add_camera_diagnostic_debug_lines(
+            forced_look_at_observation,
+            red_target_world_position,
+            client_id,
+            camera_diagnostic_debug_item_ids,
+        )
+        print(
+            "Forced look-at red target visible pixels: "
+            f"{forced_look_at_observation.target_visible_pixel_count}"
+        )
+
+        # Stage 4 fixed-mount check: use the same accepted position-only IK
+        # and motor controller for a nearby target.  No camera orientation is
+        # recomputed; only T_W_E changes as the arm moves.
+        secondary_target_name, secondary_target_position = SECONDARY_CAMERA_REFERENCE_TARGET
+        secondary_result = move_arm_smoothly_to_ik_target(
+            robot_id,
+            secondary_target_name,
+            secondary_target_position,
+            client_id,
+            debug_text_id,
+            camera_axis_debug_item_ids,
+            locked_joint_indices,
+            locked_initial_positions,
+        )
+        if secondary_result is None:
+            return
+        (
+            final_arm_joint_indices,
+            final_joint_targets,
+            debug_text_id,
+            secondary_motion_duration,
+            secondary_camera_error,
+            secondary_max_locked_deviation,
+        ) = secondary_result
+        print(f"\n{secondary_target_name} complete.")
+        print(f"Actual secondary motion duration: {secondary_motion_duration:.2f} s")
+        print(f"Secondary Camera-reference position error: {secondary_camera_error:.4f} m")
+        print(f"Secondary locked joint max deviation: {secondary_max_locked_deviation:.6f} rad")
+
+        second_camera_position, second_camera_orientation = get_camera_optical_center_pose(
+            robot_id,
+            client_id,
+        )
+        second_hand_eye_transform = get_measured_hand_eye_transform(robot_id, client_id)
+        print_camera_mount_geometry_inspection(
+            robot_id,
+            red_target_world_position,
+            client_id,
+        )
+        print_hand_eye_transform_validation(
+            "Second robot pose",
+            second_hand_eye_transform,
+            startup_hand_eye_transform,
+        )
+        second_pose_observation = capture_eye_in_hand_rgb(
+            second_camera_position,
+            second_camera_orientation,
+            red_target_world_position,
+            red_target_id,
+            client_id,
+            STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
+        )
+        print("\nSecond-pose fixed-camera RGB check:")
+        print_camera_observation(second_pose_observation, red_target_world_position)
+        print_camera_render_diagnostics(second_pose_observation, red_target_world_position)
+        camera_diagnostic_debug_item_ids = add_camera_diagnostic_debug_lines(
+            second_pose_observation,
+            red_target_world_position,
+            client_id,
+            camera_diagnostic_debug_item_ids,
+        )
+        if second_pose_observation.target_visible_pixel_count == 0:
+            raise RuntimeError(
+                "The red target was not visible from the fixed camera at the "
+                "second robot pose."
+            )
+
         final_hold_step = 0
         final_hold_status_interval_steps = max(
             1,
