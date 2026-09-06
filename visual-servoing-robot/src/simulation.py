@@ -66,11 +66,18 @@ CAMERA_REFERENCE_FRAME_NAME = "C"
 T_E_IK_REFERENCE_POSITION = (0.0, 0.0, 0.0)
 T_E_IK_REFERENCE_ORIENTATION = (0.0, 0.0, 0.0, 1.0)
 
-# Temporary physical Eye-in-Hand camera mounting transform.  Panda's hand and
-# fingers extend along E's local +Z axis, while E is within the hand collision
-# geometry.  Clearance tests selected the exterior side direction +Y_E at
-# 0.10 m.  This is a local E-frame translation, not a world-axis assumption.
-T_E_C_POSITION = (0.0, 0.10, 0.0)
+# Physical Eye-in-Hand camera mounting transform. Panda's hand and fingers
+# extend along E's local +Z axis, while E is within the hand collision
+# geometry. Candidate checks at 0.03/0.05/0.07 m along +Y_E selected 0.07 m:
+# it is the nearest requested offset with positive clearance at every tested
+# pose. This is a local E-frame translation, not a world-axis assumption.
+CAMERA_TRANSLATION_CANDIDATES_METRES = (0.03, 0.05, 0.07)
+CAMERA_TRANSLATION_DIRECTION_E = (0.0, 1.0, 0.0)
+CAMERA_SELECTED_TRANSLATION_METRES = 0.07
+T_E_C_POSITION = tuple(
+    component * CAMERA_SELECTED_TRANSLATION_METRES
+    for component in CAMERA_TRANSLATION_DIRECTION_E
+)
 # This manually selected, fixed hand-eye rotation faces the ground work area
 # from the startup pose and remains unchanged at every later pose.  It is not
 # calculated from the red target position and no look-at operation is used.
@@ -1257,6 +1264,101 @@ def update_camera_reference_axes(
     debug_item_ids[:] = new_debug_item_ids
 
 
+def update_camera_translation_candidate_markers(
+    robot_id: int,
+    client_id: int,
+    debug_item_ids: list[int],
+) -> None:
+    """Mark the requested local +Y_E camera-offset candidates in the GUI.
+
+    E itself remains visible through ``update_camera_reference_axes``.  Each
+    candidate C is labelled, given a small C-frame cross, and connected to E;
+    all positions are recomputed from the latest E pose every physics step.
+    """
+    end_effector_position, end_effector_orientation = get_end_effector_reference_pose(
+        robot_id,
+        client_id,
+    )
+    candidate_colours = (
+        [1.0, 0.45, 0.0],  # 0.03 m: orange
+        [0.0, 1.0, 1.0],  # 0.05 m: cyan
+        [1.0, 1.0, 0.0],  # 0.07 m selected: yellow
+    )
+    new_debug_item_ids: list[int] = []
+
+    def replacement_id(index: int) -> int:
+        return (
+            debug_item_ids[index]
+            if index < len(debug_item_ids) and debug_item_ids[index] >= 0
+            else -1
+        )
+
+    for candidate_index, (offset, colour) in enumerate(
+        zip(CAMERA_TRANSLATION_CANDIDATES_METRES, candidate_colours)
+    ):
+        camera_position, camera_orientation = p.multiplyTransforms(
+            end_effector_position,
+            end_effector_orientation,
+            tuple(component * offset for component in CAMERA_TRANSLATION_DIRECTION_E),
+            T_E_C_ORIENTATION,
+        )
+        marker_start, _ = p.multiplyTransforms(
+            camera_position,
+            camera_orientation,
+            (-0.018, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        marker_end, _ = p.multiplyTransforms(
+            camera_position,
+            camera_orientation,
+            (0.018, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        label_position, _ = p.multiplyTransforms(
+            camera_position,
+            camera_orientation,
+            (0.0, 0.0, 0.03),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        is_selected = abs(offset - CAMERA_SELECTED_TRANSLATION_METRES) < 1e-9
+        label = f"C offset {offset:.2f} m" + (" (selected)" if is_selected else "")
+        base_index = candidate_index * 3
+        new_debug_item_ids.append(
+            p.addUserDebugLine(
+                end_effector_position,
+                camera_position,
+                lineColorRGB=colour,
+                lineWidth=2,
+                lifeTime=0,
+                replaceItemUniqueId=replacement_id(base_index),
+                physicsClientId=client_id,
+            )
+        )
+        new_debug_item_ids.append(
+            p.addUserDebugLine(
+                marker_start,
+                marker_end,
+                lineColorRGB=colour,
+                lineWidth=5,
+                lifeTime=0,
+                replaceItemUniqueId=replacement_id(base_index + 1),
+                physicsClientId=client_id,
+            )
+        )
+        new_debug_item_ids.append(
+            p.addUserDebugText(
+                label,
+                label_position,
+                textColorRGB=colour,
+                textSize=1.0,
+                lifeTime=0,
+                replaceItemUniqueId=replacement_id(base_index + 2),
+                physicsClientId=client_id,
+            )
+        )
+    debug_item_ids[:] = new_debug_item_ids
+
+
 def update_live_eye_in_hand_camera(
     robot_id: int,
     simulation_step: int,
@@ -1311,6 +1413,7 @@ def wait_with_static_arm(
     locked_initial_positions: dict[int, float],
     client_id: int,
     camera_axis_debug_item_ids: list[int],
+    camera_offset_candidate_debug_item_ids: list[int],
     camera_display: EyeInHandRgbDisplay,
 ) -> bool:
     """Hold Panda with the same constrained controller used during IK motion."""
@@ -1341,6 +1444,11 @@ def wait_with_static_arm(
             client_id,
             camera_axis_debug_item_ids,
         )
+        update_camera_translation_candidate_markers(
+            robot_id,
+            client_id,
+            camera_offset_candidate_debug_item_ids,
+        )
         update_live_eye_in_hand_camera(
             robot_id,
             simulation_step,
@@ -1365,6 +1473,7 @@ def move_arm_smoothly_to_ik_target(
     client_id: int,
     debug_text_id: int | None,
     camera_axis_debug_item_ids: list[int],
+    camera_offset_candidate_debug_item_ids: list[int],
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
     camera_display: EyeInHandRgbDisplay,
@@ -1429,6 +1538,11 @@ def move_arm_smoothly_to_ik_target(
             robot_id,
             client_id,
             camera_axis_debug_item_ids,
+        )
+        update_camera_translation_candidate_markers(
+            robot_id,
+            client_id,
+            camera_offset_candidate_debug_item_ids,
         )
         update_live_eye_in_hand_camera(
             robot_id,
@@ -1635,7 +1749,13 @@ def run_position_ik_gui_example(
 
         add_target_markers(target_sequence, client_id)
         camera_axis_debug_item_ids: list[int] = []
+        camera_offset_candidate_debug_item_ids: list[int] = []
         update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+        update_camera_translation_candidate_markers(
+            robot_id,
+            client_id,
+            camera_offset_candidate_debug_item_ids,
+        )
         debug_text_id = update_motion_debug_text(
             f"Starting in {STARTUP_PAUSE_SECONDS:.0f} seconds",
             None,
@@ -1650,6 +1770,7 @@ def run_position_ik_gui_example(
             locked_initial_positions,
             client_id,
             camera_axis_debug_item_ids,
+            camera_offset_candidate_debug_item_ids,
             camera_display,
         ):
             return
@@ -1663,6 +1784,7 @@ def run_position_ik_gui_example(
             client_id,
             debug_text_id,
             camera_axis_debug_item_ids,
+            camera_offset_candidate_debug_item_ids,
             locked_joint_indices,
             locked_initial_positions,
             camera_display,
@@ -1755,6 +1877,7 @@ def run_position_ik_gui_example(
             client_id,
             debug_text_id,
             camera_axis_debug_item_ids,
+            camera_offset_candidate_debug_item_ids,
             locked_joint_indices,
             locked_initial_positions,
             camera_display,
@@ -1830,6 +1953,11 @@ def run_position_ik_gui_example(
                 robot_id,
                 client_id,
                 camera_axis_debug_item_ids,
+            )
+            update_camera_translation_candidate_markers(
+                robot_id,
+                client_id,
+                camera_offset_candidate_debug_item_ids,
             )
             update_live_eye_in_hand_camera(
                 robot_id,
