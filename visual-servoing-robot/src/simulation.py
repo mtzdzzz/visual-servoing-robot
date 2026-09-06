@@ -1,7 +1,8 @@
-"""Inspect a Panda arm, run safe motion, and render a PyBullet RGB preview.
+"""Inspect Panda or run the RGB-detection hold loop in PyBullet.
 
-The RGB preview is observation-only.  It does not implement image detection,
-visual servoing, PID, ROS, Gazebo, or YOLO.
+The default loop preserves the accepted Stage 3.1 locked-joint baseline and
+fixed hand-eye camera. It performs Stage 5 image detection but deliberately
+does not implement visual-servo motion, PID, ROS, Gazebo, or YOLO.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from camera_observation import (
     capture_eye_in_hand_rgb,
     capture_forced_look_at_rgb,
     create_red_ground_target,
+    detect_red_target_from_live_rgb,
     print_camera_coordinate_definition,
     print_camera_observation,
     print_camera_render_diagnostics,
@@ -53,6 +55,7 @@ CAMERA_UPDATE_INTERVAL_STEPS = max(
     1,
     round(1.0 / (TIME_STEP * CAMERA_DISPLAY_FREQUENCY_HZ)),
 )
+TARGET_DETECTION_PRINT_INTERVAL_STEPS = max(1, round(1.0 / TIME_STEP))
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -87,8 +90,9 @@ T_E_C_ORIENTATION = p.getQuaternionFromEuler(
 )
 CAMERA_CLEARANCE_PROBE_RADIUS = 0.01  # metres; diagnostic only, not rendered
 
-# A tested upper-arm-workspace position for the existing Stage 3.1 IK
-# reference, in metres.  It is intentionally not changed by the camera mount.
+# Archived Stage 3/4 Cartesian test targets.  They remain defined only for
+# the explicitly disabled legacy demo below and are never consulted by the
+# default RGB-detection startup path.
 SAFE_CAMERA_ORIGIN_TARGET_POSITION = (0.09, -0.09, 1.08)
 DEFAULT_CAMERA_REFERENCE_TARGET_SEQUENCE = (
     ("Camera Origin Test", SAFE_CAMERA_ORIGIN_TARGET_POSITION),
@@ -96,6 +100,17 @@ DEFAULT_CAMERA_REFERENCE_TARGET_SEQUENCE = (
 SECONDARY_CAMERA_REFERENCE_TARGET = (
     "Small Camera-Follow Check",
     (0.092, -0.092, 1.078),
+)
+LEGACY_FIXED_MOTION_ENABLED = False
+VISUAL_SERVO_MOTION_ENABLED = False
+# This is the accepted Stage 3.1 baseline.  The values are recorded from the
+# loaded Panda at startup and applied on every control step; they are not IK
+# targets.
+BASELINE_LOCKED_JOINT_NAMES = (
+    "panda_joint1",
+    "panda_joint2",
+    "panda_joint3",
+    "panda_joint4",
 )
 LOCKING_STRATEGIES = (
     (
@@ -1384,7 +1399,28 @@ def update_live_eye_in_hand_camera(
         camera_orientation,
         client_id,
     )
-    camera_display.show(live_frame)
+    red_detection = detect_red_target_from_live_rgb(live_frame)
+    camera_display.show(live_frame, red_detection.annotated_rgba_buffer)
+    if simulation_step % TARGET_DETECTION_PRINT_INTERVAL_STEPS == 0:
+        if red_detection.detected:
+            assert red_detection.centroid is not None
+            assert red_detection.pixel_error is not None
+            assert red_detection.bounding_box is not None
+            assert red_detection.contour_area is not None
+            print(
+                "Red target detection: "
+                f"target pixel = {red_detection.centroid}; "
+                f"image center = {red_detection.image_center}; "
+                f"ex = {red_detection.pixel_error[0]}, "
+                f"ey = {red_detection.pixel_error[1]}; "
+                f"bbox = {red_detection.bounding_box}; "
+                f"area = {red_detection.contour_area:.1f} px"
+            )
+        else:
+            print(
+                "Red target detection: Target not detected; "
+                f"image center = {red_detection.image_center}"
+            )
 
 
 def update_motion_debug_text(
@@ -1405,6 +1441,24 @@ def update_motion_debug_text(
     )
 
 
+def enable_pybullet_camera_debug_previews(client_id: int) -> None:
+    """Show PyBullet's diagnostic previews for the live camera render stream.
+
+    They are GUI diagnostics only. The Stage 5 detector still receives only
+    the RGBA RGB frame returned by the Eye-in-Hand getCameraImage call.
+    """
+    for preview_flag in (
+        p.COV_ENABLE_RGB_BUFFER_PREVIEW,
+        p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
+        p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW,
+    ):
+        p.configureDebugVisualizer(
+            preview_flag,
+            1,
+            physicsClientId=client_id,
+        )
+
+
 def wait_with_static_arm(
     duration: float,
     robot_id: int,
@@ -1416,7 +1470,7 @@ def wait_with_static_arm(
     camera_offset_candidate_debug_item_ids: list[int],
     camera_display: EyeInHandRgbDisplay,
 ) -> bool:
-    """Hold Panda with the same constrained controller used during IK motion."""
+    """Hold Panda while keeping the Eye-in-Hand camera active every frame."""
     static_waypoint_positions = [
         initial_arm_positions[joint_index] for joint_index in arm_joint_indices
     ]
@@ -1449,6 +1503,8 @@ def wait_with_static_arm(
             client_id,
             camera_offset_candidate_debug_item_ids,
         )
+        # Camera rendering is deliberately independent of robot motion,
+        # legacy demos, visual-servo state, and target-detection outcome.
         update_live_eye_in_hand_camera(
             robot_id,
             simulation_step,
@@ -1624,6 +1680,179 @@ def move_arm_smoothly_to_ik_target(
     return None
 
 
+def run_rgb_detection_hold_gui() -> None:
+    """Run the Stage 6-ready observation loop without any fixed robot motion.
+
+    Startup and the continuous loop use the accepted constrained
+    POSITION_CONTROL baseline purely to hold the recorded initial pose. A
+    future visual-servo controller may consume the live (ex, ey) output, but
+    until that controller is deliberately enabled, it supplies no joint or
+    Cartesian target at all.
+    """
+    client_id = p.connect(p.GUI)
+    if client_id < 0:
+        raise RuntimeError("Unable to open the PyBullet GUI.")
+
+    camera_display: EyeInHandRgbDisplay | None = None
+    try:
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        p.setGravity(0, 0, 0, physicsClientId=client_id)
+        p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+        enable_pybullet_camera_debug_previews(client_id)
+        p.loadURDF("plane.urdf", physicsClientId=client_id)
+        robot_id = p.loadURDF(
+            "franka_panda/panda.urdf",
+            useFixedBase=True,
+            physicsClientId=client_id,
+        )
+
+        end_effector_name = _decode_name(
+            p.getJointInfo(
+                robot_id,
+                END_EFFECTOR_LINK_INDEX,
+                physicsClientId=client_id,
+            )[12]
+        )
+        if end_effector_name != END_EFFECTOR_LINK_NAME:
+            raise RuntimeError(
+                "The configured end-effector link no longer matches the selected "
+                f"E frame {END_EFFECTOR_LINK_NAME!r}; "
+                f"loaded {end_effector_name!r} instead."
+            )
+
+        print_camera_reference_inspection(robot_id, client_id)
+        initial_arm_positions = print_panda_arm_joint_configuration(robot_id, client_id)
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+        locked_joint_indices = [
+            arm_joint_names[joint_name] for joint_name in BASELINE_LOCKED_JOINT_NAMES
+        ]
+        locked_initial_positions = {
+            joint_index: initial_arm_positions[joint_index]
+            for joint_index in locked_joint_indices
+        }
+        active_joint_names = [
+            joint_name
+            for joint_name, joint_index in arm_joint_names.items()
+            if joint_index not in locked_joint_indices
+        ]
+        print("Stage 3.1 baseline locked joints:", list(BASELINE_LOCKED_JOINT_NAMES))
+        print("Stage 3.1 baseline active joints:", active_joint_names)
+
+        # This creates only the visual red sphere. Its world position is never
+        # passed to IK, a motor command, or the RGB detector.
+        create_red_ground_target(client_id)
+        print_camera_coordinate_definition()
+        camera_display = EyeInHandRgbDisplay()
+        print(
+            "Live Eye-in-Hand RGB refresh: "
+            f"{CAMERA_DISPLAY_FREQUENCY_HZ:.0f} Hz "
+            f"(every {CAMERA_UPDATE_INTERVAL_STEPS} simulation steps)."
+        )
+
+        camera_axis_debug_item_ids: list[int] = []
+        camera_offset_candidate_debug_item_ids: list[int] = []
+        update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+        update_camera_translation_candidate_markers(
+            robot_id,
+            client_id,
+            camera_offset_candidate_debug_item_ids,
+        )
+        debug_text_id = update_motion_debug_text(
+            f"Initializing: Robot HOLD | Camera ACTIVE ({STARTUP_PAUSE_SECONDS:.0f} s)",
+            None,
+            client_id,
+        )
+        print("Initialization phase:")
+        print("Robot: HOLD")
+        print("Eye-in-Hand Camera: ACTIVE")
+        print(f"Holding initial Panda pose for {STARTUP_PAUSE_SECONDS:.1f} s.")
+        if not wait_with_static_arm(
+            STARTUP_PAUSE_SECONDS,
+            robot_id,
+            arm_joint_indices,
+            initial_arm_positions,
+            locked_initial_positions,
+            client_id,
+            camera_axis_debug_item_ids,
+            camera_offset_candidate_debug_item_ids,
+            camera_display,
+        ):
+            return
+
+        debug_text_id = update_motion_debug_text(
+            "RGB detection active: holding initial Panda pose",
+            debug_text_id,
+            client_id,
+        )
+        print("Legacy Fixed Motion: DISABLED")
+        robot_mode = "VISUAL SERVO" if VISUAL_SERVO_MOTION_ENABLED else "HOLD"
+        print("After initialization:")
+        print(f"Robot: {robot_mode}")
+        print("Eye-in-Hand Camera: ACTIVE")
+        print(
+            "Visual Servo Motion Source: "
+            f"{'ENABLED' if VISUAL_SERVO_MOTION_ENABLED else 'NOT YET ENABLED'}"
+        )
+        print(
+            "RGB detection is observation-only. The detected (ex, ey) is "
+            "available for a future visual-servo controller; no motion command "
+            "is generated in this stage."
+        )
+        print("Close the PyBullet GUI window to finish the example.")
+
+        hold_targets = [
+            initial_arm_positions[joint_index] for joint_index in arm_joint_indices
+        ]
+        simulation_step = 0
+        status_interval_steps = max(
+            1,
+            round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
+        )
+        while p.isConnected(client_id):
+            # Holding targets are the startup angles, not an IK solution. The
+            # constrained controller re-applies the recorded locked targets at
+            # every step while the active joints remain at their start angles.
+            apply_constrained_arm_position_control(
+                robot_id,
+                arm_joint_indices,
+                hold_targets,
+                locked_initial_positions,
+                client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            update_camera_reference_axes(
+                robot_id,
+                client_id,
+                camera_axis_debug_item_ids,
+            )
+            update_camera_translation_candidate_markers(
+                robot_id,
+                client_id,
+                camera_offset_candidate_debug_item_ids,
+            )
+            update_live_eye_in_hand_camera(
+                robot_id,
+                simulation_step,
+                client_id,
+                camera_display,
+            )
+            simulation_step += 1
+            if simulation_step % status_interval_steps == 0:
+                print_locked_joint_status(
+                    "HOLD",
+                    robot_id,
+                    locked_initial_positions,
+                    client_id,
+                )
+            time.sleep(TIME_STEP)
+    finally:
+        if camera_display is not None:
+            camera_display.close()
+        if p.isConnected(client_id):
+            p.disconnect(physicsClientId=client_id)
+
+
 def run_position_ik_gui_example(
     target_sequence: Sequence[tuple[str, Sequence[float]]],
 ) -> None:
@@ -1635,6 +1864,11 @@ def run_position_ik_gui_example(
     simulation loop to Panda's seven revolute arm joints using
     ``POSITION_CONTROL``.
     """
+    if not LEGACY_FIXED_MOTION_ENABLED:
+        raise RuntimeError(
+            "Legacy fixed Cartesian/IK motion is disabled. "
+            "Run the default RGB-detection hold loop instead."
+        )
     if len(target_sequence) != 1:
         raise ValueError("This constrained Stage 3 check accepts exactly one target point.")
 
@@ -1988,6 +2222,10 @@ def run_single_joint_gui_example() -> None:
     stay still instead of falling.  No motor-control command is sent to any
     joint other than ``CONTROLLED_JOINT_INDEX``.
     """
+    if not LEGACY_FIXED_MOTION_ENABLED:
+        raise RuntimeError(
+            "Legacy single-joint motion is disabled during Stage 6 preparation."
+        )
     client_id = p.connect(p.GUI)
     if client_id < 0:
         raise RuntimeError("Unable to open the PyBullet GUI.")
@@ -2048,28 +2286,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Print Panda's joint/link structure in headless DIRECT mode.",
     )
-    parser.add_argument(
-        "--single-joint",
-        action="store_true",
-        help="Run the earlier single-joint GUI motion example instead of IK.",
-    )
-    parser.add_argument(
-        "--target",
-        nargs=3,
-        type=float,
-        metavar=("X", "Y", "Z"),
-        help="Run one custom future-Camera-origin XYZ target in metres.",
-    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
-    elif arguments.single_joint:
-        run_single_joint_gui_example()
     else:
-        target_sequence = (
-            (("Custom Camera Origin", arguments.target),)
-            if arguments.target is not None
-            else DEFAULT_CAMERA_REFERENCE_TARGET_SEQUENCE
-        )
-        run_position_ik_gui_example(target_sequence)
+        run_rgb_detection_hold_gui()

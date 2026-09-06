@@ -14,6 +14,8 @@ from pathlib import Path
 from struct import pack
 from typing import Sequence
 
+import cv2
+import numpy as np
 import pybullet as p
 
 
@@ -25,6 +27,13 @@ CAMERA_IMAGE_HEIGHT = 480
 CAMERA_FOV_Y_DEGREES = 60.0
 CAMERA_NEAR_PLANE = 0.01
 CAMERA_FAR_PLANE = 3.0
+# HSV red wraps around OpenCV's hue range (0--180), therefore detection uses
+# the two edge intervals below. These parameters apply only to RGB-image
+# analysis and never feed a robot controller.
+RED_HSV_LOWER_RANGE = ((0, 100, 70), (10, 255, 255))
+RED_HSV_UPPER_RANGE = ((170, 100, 70), (180, 255, 255))
+RED_MORPH_KERNEL_SIZE = 5
+RED_MIN_CONTOUR_AREA_PIXELS = 80.0
 CAMERA_RGB_OUTPUT_PATH = (
     Path(__file__).resolve().parents[1] / "outputs" / "eye_in_hand_rgb_latest.bmp"
 )
@@ -107,6 +116,25 @@ class LiveCameraFrame:
     image_width: int
     image_height: int
     rgba_buffer: object
+
+
+@dataclass(frozen=True)
+class RedTargetDetection:
+    """Result obtained strictly from one Eye-in-Hand RGB frame.
+
+    This data type deliberately contains no PyBullet body identifier,
+    segmentation mask, or target world-coordinate input. It is suitable for
+    Stage 5 image-space observation only; no control command is derived from
+    it.
+    """
+
+    detected: bool
+    bounding_box: tuple[int, int, int, int] | None
+    contour_area: float | None
+    centroid: tuple[int, int] | None
+    image_center: tuple[int, int]
+    pixel_error: tuple[int, int] | None
+    annotated_rgba_buffer: bytes
 
 
 def create_red_ground_target(client_id: int) -> tuple[int, list[float]]:
@@ -342,6 +370,26 @@ def _render_with_parameters(
     return image_width, image_height, rgba_buffer, segmentation_buffer
 
 
+def _render_rgb_with_parameters(
+    render_parameters: CameraRenderParameters,
+    client_id: int,
+) -> tuple[int, int, object]:
+    """Render RGB only for the real-time Stage 5 image-analysis path.
+
+    No segmentation flag is requested and no ground-truth render output is
+    returned to the caller.
+    """
+    image_width, image_height, rgba_buffer, _, _ = p.getCameraImage(
+        CAMERA_IMAGE_WIDTH,
+        CAMERA_IMAGE_HEIGHT,
+        viewMatrix=render_parameters.view_matrix,
+        projectionMatrix=render_parameters.projection_matrix,
+        renderer=p.ER_TINY_RENDERER,
+        physicsClientId=client_id,
+    )
+    return image_width, image_height, rgba_buffer
+
+
 def render_live_eye_in_hand_rgb_frame(
     camera_reference_world_position: Sequence[float],
     camera_reference_world_orientation: Sequence[float],
@@ -371,7 +419,7 @@ def render_live_eye_in_hand_rgb_frame(
         ],
         camera_y_axis_world,
     )
-    image_width, image_height, rgba_buffer, _ = _render_with_parameters(
+    image_width, image_height, rgba_buffer = _render_rgb_with_parameters(
         render_parameters,
         client_id,
     )
@@ -383,6 +431,142 @@ def render_live_eye_in_hand_rgb_frame(
         image_width=image_width,
         image_height=image_height,
         rgba_buffer=rgba_buffer,
+    )
+
+
+def detect_red_target_from_live_rgb(frame: LiveCameraFrame) -> RedTargetDetection:
+    """Detect the largest plausible red contour from raw Eye-in-Hand RGB.
+
+    The input is exclusively LiveCameraFrame.rgba_buffer produced by
+    getCameraImage. In particular, this function accepts neither a target
+    position nor a PyBullet segmentation/object-ID value.
+    """
+    rgba_bytes = _rgba_buffer_to_bytes(frame.rgba_buffer)
+    expected_byte_count = frame.image_width * frame.image_height * 4
+    if len(rgba_bytes) != expected_byte_count:
+        raise RuntimeError(
+            "PyBullet returned an unexpected live RGBA buffer length: "
+            f"expected {expected_byte_count}, got {len(rgba_bytes)}."
+        )
+
+    rgba_image = np.frombuffer(rgba_bytes, dtype=np.uint8).reshape(
+        (frame.image_height, frame.image_width, 4)
+    )
+    bgr_image = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGR)
+    hsv_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+    lower_red_mask = cv2.inRange(
+        hsv_image,
+        np.array(RED_HSV_LOWER_RANGE[0], dtype=np.uint8),
+        np.array(RED_HSV_LOWER_RANGE[1], dtype=np.uint8),
+    )
+    upper_red_mask = cv2.inRange(
+        hsv_image,
+        np.array(RED_HSV_UPPER_RANGE[0], dtype=np.uint8),
+        np.array(RED_HSV_UPPER_RANGE[1], dtype=np.uint8),
+    )
+    red_mask = cv2.bitwise_or(lower_red_mask, upper_red_mask)
+    morph_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (RED_MORPH_KERNEL_SIZE, RED_MORPH_KERNEL_SIZE),
+    )
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, morph_kernel)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, morph_kernel)
+
+    contour_result = cv2.findContours(
+        red_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    contours = contour_result[-2]
+    valid_contours = [
+        contour
+        for contour in contours
+        if cv2.contourArea(contour) >= RED_MIN_CONTOUR_AREA_PIXELS
+    ]
+
+    annotated_bgr = bgr_image.copy()
+    image_center = (frame.image_width // 2, frame.image_height // 2)
+    cv2.drawMarker(
+        annotated_bgr,
+        image_center,
+        (255, 0, 255),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=20,
+        thickness=2,
+    )
+
+    if not valid_contours:
+        cv2.putText(
+            annotated_bgr,
+            "Target not detected",
+            (16, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        annotated_rgba = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGBA).tobytes()
+        return RedTargetDetection(
+            detected=False,
+            bounding_box=None,
+            contour_area=None,
+            centroid=None,
+            image_center=image_center,
+            pixel_error=None,
+            annotated_rgba_buffer=annotated_rgba,
+        )
+
+    target_contour = max(valid_contours, key=cv2.contourArea)
+    contour_area = float(cv2.contourArea(target_contour))
+    bounding_box = tuple(int(value) for value in cv2.boundingRect(target_contour))
+    moments = cv2.moments(target_contour)
+    if moments["m00"] <= 1e-9:
+        raise RuntimeError("Selected red contour has zero area moment.")
+    centroid = (
+        int(round(moments["m10"] / moments["m00"])),
+        int(round(moments["m01"] / moments["m00"])),
+    )
+    pixel_error = (
+        centroid[0] - image_center[0],
+        centroid[1] - image_center[1],
+    )
+    x, y, width, height = bounding_box
+    cv2.drawContours(annotated_bgr, [target_contour], -1, (0, 255, 0), 2)
+    cv2.rectangle(
+        annotated_bgr,
+        (x, y),
+        (x + width, y + height),
+        (0, 255, 0),
+        2,
+    )
+    cv2.drawMarker(
+        annotated_bgr,
+        centroid,
+        (0, 255, 255),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=16,
+        thickness=2,
+    )
+    cv2.putText(
+        annotated_bgr,
+        f"Target: ({centroid[0]}, {centroid[1]})",
+        (max(8, x), max(24, y - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    annotated_rgba = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGBA).tobytes()
+    return RedTargetDetection(
+        detected=True,
+        bounding_box=bounding_box,
+        contour_area=contour_area,
+        centroid=centroid,
+        image_center=image_center,
+        pixel_error=pixel_error,
+        annotated_rgba_buffer=annotated_rgba,
     )
 
 
@@ -430,12 +614,18 @@ class EyeInHandRgbDisplay:
         self._root = None
         self._label = None
 
-    def show(self, frame: LiveCameraFrame) -> None:
-        """Display one RGBA PyBullet frame as an RGB image without saving it."""
+    def show(
+        self,
+        frame: LiveCameraFrame,
+        rgba_buffer: object | None = None,
+    ) -> None:
+        """Display a raw or annotated RGBA Eye-in-Hand frame without saving it."""
         if not self.is_open or self._root is None or self._label is None or self._tk is None:
             return
         try:
-            rgba_bytes = _rgba_buffer_to_bytes(frame.rgba_buffer)
+            rgba_bytes = _rgba_buffer_to_bytes(
+                frame.rgba_buffer if rgba_buffer is None else rgba_buffer
+            )
             expected_byte_count = frame.image_width * frame.image_height * 4
             if len(rgba_bytes) != expected_byte_count:
                 raise RuntimeError(
