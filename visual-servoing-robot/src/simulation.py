@@ -1,14 +1,15 @@
-"""Inspect Panda or run the RGB-detection hold loop in PyBullet.
+"""Inspect Panda or run the Stage 6A Camera-X visual-servo check in PyBullet.
 
 The default loop preserves the accepted Stage 3.1 locked-joint baseline and
-fixed hand-eye camera. It performs Stage 5 image detection but deliberately
-does not implement visual-servo motion, PID, ROS, Gazebo, or YOLO.
+fixed hand-eye camera. It performs Stage 5 RGB detection and a bounded
+ex-only proportional Camera-X validation; it does not implement PID, y-axis
+control, ROS, Gazebo, grasping, TCP compensation, or YOLO.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import acos, degrees, radians, sqrt
 import time
 from typing import Sequence
@@ -21,7 +22,9 @@ from camera_observation import (
     STAGE4_FINAL_RGB_OUTPUT_PATH,
     STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
     EyeInHandRgbDisplay,
+    RedTargetDetection,
     add_camera_diagnostic_debug_lines,
+    add_servo_state_overlay,
     capture_eye_in_hand_rgb,
     capture_forced_look_at_rgb,
     create_red_ground_target,
@@ -56,6 +59,31 @@ CAMERA_UPDATE_INTERVAL_STEPS = max(
     round(1.0 / (TIME_STEP * CAMERA_DISPLAY_FREQUENCY_HZ)),
 )
 TARGET_DETECTION_PRINT_INTERVAL_STEPS = max(1, round(1.0 / TIME_STEP))
+SINGLE_AXIS_CALIBRATION_STEP_METRES = 0.002
+# The raw P term is still hard-clamped to 2 mm below.  This value keeps the
+# command at that conservative physical limit until the target is near center.
+SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL = 0.0001
+SINGLE_AXIS_SERVO_MAX_STEP_METRES = 0.002
+SINGLE_AXIS_SERVO_EX_GOAL_PIXELS = 10
+SINGLE_AXIS_CALIBRATION_MIN_RESPONSE_PIXELS = 1
+# The locked-joint numerical IK leaves a measured residual of about 1.3 mm for
+# a 2 mm Camera-X command; accepting up to 2 mm lets RGB feedback close the
+# loop from the actual pose without weakening the 2 mm physical step limit.
+SINGLE_AXIS_CAMERA_TARGET_TOLERANCE_METRES = 0.002
+# A waypoint is complete only after the *active* joints have reached the
+# commanded IK target.  Camera-position residual is deliberately not used as
+# completion criteria, because the permitted 2 mm planning residual could
+# otherwise acknowledge a 2 mm command before the robot moves at all.
+# The accepted Stage 3.1 low-gain controller has a measured 0.0046 rad
+# active-joint steady-state error on this small waypoint, so 0.006 rad is the
+# practical completion band.  A separate four-render-frame minimum below
+# guarantees the waypoint has first been physically applied.
+SINGLE_AXIS_ACTIVE_JOINT_TARGET_TOLERANCE_RAD = 0.006
+SINGLE_AXIS_MIN_WAYPOINT_RENDER_FRAMES = 4
+SINGLE_AXIS_CAMERA_IK_CORRECTION_ITERATIONS = 3
+SINGLE_AXIS_COMMAND_TIMEOUT_RENDER_FRAMES = 160
+SINGLE_AXIS_MAX_CONSECUTIVE_ERROR_INCREASES = 3
+SINGLE_AXIS_MAX_CONTROL_STEPS = 120
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -102,7 +130,9 @@ SECONDARY_CAMERA_REFERENCE_TARGET = (
     (0.092, -0.092, 1.078),
 )
 LEGACY_FIXED_MOTION_ENABLED = False
-VISUAL_SERVO_MOTION_ENABLED = False
+# Stage 6A: the calibration and P loop below use the horizontal Camera-X
+# component of ex only.  No y-axis/image-ey motion is permitted in this stage.
+VISUAL_SERVO_MOTION_ENABLED = True
 # This is the accepted Stage 3.1 baseline.  The values are recorded from the
 # loaded Panda at startup and applied on every control step; they are not IK
 # targets.
@@ -140,10 +170,14 @@ TRAJECTORY_MAX_WAYPOINT_SPEED = 0.18  # radians/second
 CONTROL_STATUS_INTERVAL_SECONDS = 0.5
 MIN_TRAJECTORY_DURATION = 5.0  # seconds; Stage 3 visual-motion minimum
 POST_TRAJECTORY_SETTLE_SECONDS = 3.0
-STARTUP_PAUSE_SECONDS = 3.0
+# The default Stage 6A path does not command a startup pose.  Archived legacy
+# demos may still use this duration explicitly, but the RGB/servo loop starts
+# from the loaded/current Panda pose immediately.
+STARTUP_PAUSE_SECONDS = 0.0
 DEBUG_STATUS_TEXT_POSITION = (0.0, 0.0, 1.35)
 DEBUG_TARGET_MARKER_SIZE = 0.045
 CAMERA_AXIS_LENGTH = 0.10
+HORIZONTAL_RECALIBRATION_KEY_CODES = (ord("r"), ord("R"))
 
 
 @dataclass(frozen=True)
@@ -157,6 +191,83 @@ class LockingStrategyEvaluation:
     max_locked_deviation: float
     motion_stable: bool
     reachable: bool
+
+
+@dataclass(frozen=True)
+class CameraAxisMotionCommand:
+    """One bounded Camera-frame translation executed through constrained IK."""
+
+    label: str
+    camera_delta_c: tuple[float, float, float]
+    camera_delta_w: tuple[float, float, float]
+    target_camera_position: tuple[float, float, float]
+    joint_targets: tuple[float, ...]
+    camera_target_error: float
+
+
+@dataclass
+class SingleAxisVisualServo:
+    """Stage 6A state machine: calibrate Camera X, then close only on ex."""
+
+    state: str = "CALIBRATION: WAITING FOR TARGET"
+    initial_u: int | None = None
+    initial_ex: int | None = None
+    plus_x_u: int | None = None
+    plus_x_ex: int | None = None
+    minus_x_u: int | None = None
+    minus_x_ex: int | None = None
+    control_direction: int | None = None
+    calibration_initial_joint_targets: tuple[float, ...] | None = None
+    calibration_initial_camera_position: tuple[float, float, float] | None = None
+    pending_command: CameraAxisMotionCommand | None = None
+    pending_render_frames: int = 0
+    motion_completed: bool = False
+    previous_abs_ex: int | None = None
+    consecutive_error_increases: int = 0
+    control_steps: int = 0
+    control_started_at: float | None = None
+    recent_control_history: list[tuple[int, float, tuple[float, float, float]]] = field(
+        default_factory=list
+    )
+    first_servo_command_logged: bool = False
+    hold_requested: bool = False
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state.startswith(
+            ("HORIZONTAL CENTERED", "DIVERGING", "FAIL", "TARGET LOST", "HOLD")
+        )
+
+    def request_hold(self, state: str) -> None:
+        self.state = state
+        self.pending_command = None
+        self.hold_requested = True
+
+    def record_completed_p_step(
+        self,
+        ex: int,
+        command_delta_x: float,
+        camera_position: Sequence[float],
+    ) -> None:
+        """Keep the last five measured horizontal-control samples for safety logs."""
+        self.recent_control_history.append(
+            (ex, command_delta_x, tuple(camera_position))
+        )
+        del self.recent_control_history[:-5]
+
+
+def get_locked_joint_report_phase(servo: SingleAxisVisualServo) -> str:
+    """Map Stage 6A detail states onto the strict HOLD/MOVE report contract."""
+    return "MOVE" if servo.pending_command is not None and not servo.is_terminal else "HOLD"
+
+
+def horizontal_recalibration_requested(client_id: int) -> bool:
+    """Return True only when the user requests a safe Stage 6A recalibration."""
+    keyboard_events = p.getKeyboardEvents(physicsClientId=client_id)
+    return any(
+        keyboard_events.get(key_code, 0) & p.KEY_WAS_TRIGGERED
+        for key_code in HORIZONTAL_RECALIBRATION_KEY_CODES
+    )
 
 
 def _decode_name(value: bytes | str) -> str:
@@ -835,6 +946,490 @@ def calculate_constrained_position_ik(
     )
 
 
+def camera_frame_delta_to_world(
+    camera_position: Sequence[float],
+    camera_orientation: Sequence[float],
+    camera_delta_c: Sequence[float],
+) -> list[float]:
+    """Calculate delta_p_W = R_W_C @ delta_p_C for one Camera-frame offset."""
+    if len(camera_delta_c) != 3:
+        raise ValueError("Camera-frame translation must contain exactly [x, y, z].")
+    endpoint, _ = p.multiplyTransforms(
+        camera_position,
+        camera_orientation,
+        camera_delta_c,
+        (0.0, 0.0, 0.0, 1.0),
+    )
+    return [
+        endpoint[index] - camera_position[index]
+        for index in range(3)
+    ]
+
+
+def calculate_constrained_camera_position_ik(
+    robot_id: int,
+    target_camera_position: Sequence[float],
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> tuple[list[int], list[float], float]:
+    """Solve a small C-position target using the unchanged constrained E IK.
+
+    The existing Stage 3.1 solver remains responsible for all joint-limit,
+    active-joint, and locked-joint logic. This wrapper corrects its E-frame
+    target against the measured physical C position so the fixed T_E_C offset
+    is respected without changing that accepted baseline solver.
+    """
+    if len(target_camera_position) != 3:
+        raise ValueError("target_camera_position must contain exactly [x, y, z].")
+
+    current_camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+    current_end_effector_position, _ = get_camera_reference_pose(robot_id, client_id)
+    end_effector_target = [
+        end_effector + (target_camera - current_camera)
+        for end_effector, target_camera, current_camera in zip(
+            current_end_effector_position,
+            target_camera_position,
+            current_camera_position,
+        )
+    ]
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    saved_positions = [
+        p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+        for joint_index in arm_joint_indices
+    ]
+    joint_targets: list[float] | None = None
+    final_camera_error = float("inf")
+    try:
+        for _ in range(SINGLE_AXIS_CAMERA_IK_CORRECTION_ITERATIONS):
+            (
+                arm_joint_indices,
+                joint_targets,
+                _,
+            ) = calculate_constrained_position_ik(
+                robot_id,
+                end_effector_target,
+                locked_joint_indices,
+                locked_initial_positions,
+                client_id,
+            )
+            _set_arm_joint_positions(
+                robot_id,
+                arm_joint_indices,
+                joint_targets,
+                client_id,
+            )
+            predicted_camera_position, _ = get_camera_optical_center_pose(
+                robot_id,
+                client_id,
+            )
+            camera_error_vector = [
+                target - actual
+                for target, actual in zip(
+                    target_camera_position,
+                    predicted_camera_position,
+                )
+            ]
+            final_camera_error = sqrt(
+                sum(component * component for component in camera_error_vector)
+            )
+            if final_camera_error <= SINGLE_AXIS_CAMERA_TARGET_TOLERANCE_METRES:
+                break
+            end_effector_target = [
+                target + error
+                for target, error in zip(end_effector_target, camera_error_vector)
+            ]
+    finally:
+        _set_arm_joint_positions(
+            robot_id,
+            arm_joint_indices,
+            saved_positions,
+            client_id,
+        )
+
+    if joint_targets is None:
+        raise RuntimeError("Camera-frame constrained IK did not produce joint targets.")
+    return arm_joint_indices, joint_targets, final_camera_error
+
+
+def plan_camera_x_axis_motion(
+    robot_id: int,
+    label: str,
+    camera_delta_x: float,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand:
+    """Plan one bounded local Camera +X or -X translation through IK."""
+    if abs(camera_delta_x) > SINGLE_AXIS_SERVO_MAX_STEP_METRES + 1e-12:
+        raise ValueError(
+            "A Stage 6A Camera X command may not exceed "
+            f"{SINGLE_AXIS_SERVO_MAX_STEP_METRES:.4f} m."
+        )
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    camera_delta_c = (camera_delta_x, 0.0, 0.0)
+    camera_delta_w = camera_frame_delta_to_world(
+        camera_position,
+        camera_orientation,
+        camera_delta_c,
+    )
+    target_camera_position = [
+        position + delta
+        for position, delta in zip(camera_position, camera_delta_w)
+    ]
+    _, joint_targets, camera_target_error = calculate_constrained_camera_position_ik(
+        robot_id,
+        target_camera_position,
+        locked_joint_indices,
+        locked_initial_positions,
+        client_id,
+    )
+    if camera_target_error > SINGLE_AXIS_CAMERA_TARGET_TOLERANCE_METRES:
+        raise RuntimeError(
+            "Constrained Camera X target is not reachable within tolerance: "
+            f"{camera_target_error:.6f} m."
+        )
+    print(
+        f"{label}: delta_p_C={list(camera_delta_c)} m; "
+        f"delta_p_W={[round(value, 6) for value in camera_delta_w]} m; "
+        f"target C={[round(value, 6) for value in target_camera_position]} m; "
+        f"IK error={camera_target_error:.6f} m"
+    )
+    return CameraAxisMotionCommand(
+        label=label,
+        camera_delta_c=camera_delta_c,
+        camera_delta_w=tuple(camera_delta_w),
+        target_camera_position=tuple(target_camera_position),
+        joint_targets=tuple(joint_targets),
+        camera_target_error=camera_target_error,
+    )
+
+
+def _request_camera_x_motion(
+    servo: SingleAxisVisualServo,
+    robot_id: int,
+    label: str,
+    camera_delta_x: float,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand | None:
+    """Plan a new x-only Camera command or stop safely if constrained IK fails."""
+    try:
+        command = plan_camera_x_axis_motion(
+            robot_id,
+            label,
+            camera_delta_x,
+            locked_joint_indices,
+            locked_initial_positions,
+            client_id,
+        )
+    except RuntimeError as error:
+        print(f"{label}: control direction FAIL / HOLD ({error})")
+        servo.request_hold("FAIL: CAMERA IK / HOLD")
+        return None
+    servo.pending_command = command
+    servo.pending_render_frames = 0
+    return command
+
+
+def _request_calibration_restore(
+    servo: SingleAxisVisualServo,
+    label: str,
+) -> CameraAxisMotionCommand | None:
+    """Return exactly to the joint pose captured before the calibration probe."""
+    if (
+        servo.calibration_initial_joint_targets is None
+        or servo.calibration_initial_camera_position is None
+    ):
+        print(f"{label}: calibration start pose is unavailable; HOLD.")
+        servo.request_hold("FAIL: CALIBRATION START POSE / HOLD")
+        return None
+    command = CameraAxisMotionCommand(
+        label=label,
+        camera_delta_c=(0.0, 0.0, 0.0),
+        camera_delta_w=(0.0, 0.0, 0.0),
+        target_camera_position=servo.calibration_initial_camera_position,
+        joint_targets=servo.calibration_initial_joint_targets,
+        camera_target_error=0.0,
+    )
+    servo.pending_command = command
+    servo.pending_render_frames = 0
+    print(f"{label}: restoring the captured pre-calibration active-joint pose.")
+    return command
+
+
+def get_active_joint_target_error(
+    robot_id: int,
+    joint_targets: Sequence[float],
+    locked_joint_indices: Sequence[int],
+    client_id: int,
+) -> float:
+    """Return the largest active-joint error to one seven-joint waypoint."""
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    if len(joint_targets) != len(arm_joint_indices):
+        raise ValueError("A Stage 6A waypoint must contain seven arm targets.")
+    locked_set = set(locked_joint_indices)
+    active_errors = [
+        abs(
+            p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+            - target_position
+        )
+        for joint_index, target_position in zip(arm_joint_indices, joint_targets)
+        if joint_index not in locked_set
+    ]
+    if not active_errors:
+        raise RuntimeError("Stage 6A requires at least one active Panda joint.")
+    return max(active_errors)
+
+
+def update_single_axis_visual_servo(
+    servo: SingleAxisVisualServo,
+    detection: RedTargetDetection,
+    robot_id: int,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand | None:
+    """Advance the Camera-X calibration and ex-only P loop by one RGB frame."""
+    if servo.is_terminal:
+        return None
+    if not detection.detected:
+        print("Target lost: control paused, HOLD current pose.")
+        servo.request_hold("TARGET LOST / HOLD")
+        return None
+
+    assert detection.centroid is not None
+    assert detection.pixel_error is not None
+    u, _ = detection.centroid
+    ex, ey = detection.pixel_error
+
+    if servo.pending_command is not None:
+        active_joint_error = get_active_joint_target_error(
+            robot_id,
+            servo.pending_command.joint_targets,
+            locked_joint_indices,
+            client_id,
+        )
+        servo.pending_render_frames += 1
+        if servo.pending_render_frames < SINGLE_AXIS_MIN_WAYPOINT_RENDER_FRAMES:
+            return None
+        if active_joint_error > SINGLE_AXIS_ACTIVE_JOINT_TARGET_TOLERANCE_RAD:
+            if servo.pending_render_frames > SINGLE_AXIS_COMMAND_TIMEOUT_RENDER_FRAMES:
+                print(
+                    f"{servo.pending_command.label}: control direction FAIL / HOLD "
+                    "(active-joint waypoint timeout, "
+                    f"error={active_joint_error:.6f} rad)."
+                )
+                servo.request_hold("FAIL: ACTIVE WAYPOINT TIMEOUT / HOLD")
+            return None
+        current_camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+        motion_start_position = [
+            target - delta
+            for target, delta in zip(
+                servo.pending_command.target_camera_position,
+                servo.pending_command.camera_delta_w,
+            )
+        ]
+        actual_camera_displacement = [
+            actual - start
+            for actual, start in zip(
+                current_camera_position,
+                motion_start_position,
+            )
+        ]
+        print(
+            f"{servo.pending_command.label}: reached active-joint waypoint; "
+            f"active joint error={active_joint_error:.6f} rad; "
+            f"u={u}, ex={ex}, ey={ey} (ey is observation only)."
+        )
+        if servo.pending_command.label.startswith("P step"):
+            servo.record_completed_p_step(
+                ex,
+                servo.pending_command.camera_delta_c[0],
+                current_camera_position,
+            )
+            print(
+                "P control completion: "
+                f"ex={ex}, abs(ex)={abs(ex)}, "
+                f"commanded delta={servo.pending_command.camera_delta_c[0]:.6f} m, "
+                "actual camera displacement="
+                f"{[round(value, 6) for value in actual_camera_displacement]} m, "
+                "servo state=P CONTROL: EX ONLY"
+            )
+        servo.pending_command = None
+        servo.pending_render_frames = 0
+        servo.motion_completed = True
+
+    if servo.state == "CALIBRATION: WAITING FOR TARGET":
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        servo.initial_u = u
+        servo.initial_ex = ex
+        servo.calibration_initial_joint_targets = tuple(
+            p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+            for joint_index in arm_joint_indices
+        )
+        camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+        servo.calibration_initial_camera_position = tuple(camera_position)
+        servo.state = "CALIBRATION: +X 2 mm"
+        print(
+            "Servo State = CALIBRATING / continuous P loop paused; "
+            f"u0={u}, Initial ex={ex}, ey={ey}."
+        )
+        return _request_camera_x_motion(
+            servo,
+            robot_id,
+            "Calibration +X",
+            SINGLE_AXIS_CALIBRATION_STEP_METRES,
+            locked_joint_indices,
+            locked_initial_positions,
+            client_id,
+        )
+
+    if servo.state == "CALIBRATION: +X 2 mm":
+        servo.plus_x_u = u
+        servo.plus_x_ex = ex
+        servo.state = "CALIBRATION: RESTORE INITIAL"
+        print(f"Calibration +2 mm: u_plus={u}, +2mm ex={ex}, ey={ey}.")
+        return _request_calibration_restore(servo, "Calibration restore initial")
+
+    if servo.state == "CALIBRATION: RESTORE INITIAL":
+        servo.state = "CALIBRATION: -X 2 mm"
+        return _request_camera_x_motion(
+            servo,
+            robot_id,
+            "Calibration -X",
+            -SINGLE_AXIS_CALIBRATION_STEP_METRES,
+            locked_joint_indices,
+            locked_initial_positions,
+            client_id,
+        )
+
+    if servo.state == "CALIBRATION: -X 2 mm":
+        servo.minus_x_u = u
+        servo.minus_x_ex = ex
+        assert servo.initial_u is not None
+        assert servo.initial_ex is not None
+        assert servo.plus_x_u is not None
+        assert servo.plus_x_ex is not None
+        plus_x_response = servo.plus_x_ex - servo.initial_ex
+        minus_x_response = servo.minus_x_ex - servo.initial_ex
+        signed_camera_x_response = servo.plus_x_ex - servo.minus_x_ex
+        plus_x_abs_error = abs(servo.plus_x_ex)
+        minus_x_abs_error = abs(servo.minus_x_ex)
+        initial_abs_error = abs(servo.initial_ex)
+        print(
+            "Calibration result: "
+            f"u0={servo.initial_u}, Initial ex={servo.initial_ex}; "
+            f"u_plus={servo.plus_x_u}, +2mm ex={servo.plus_x_ex}; "
+            f"u_minus={servo.minus_x_u}, -2mm ex={servo.minus_x_ex}."
+        )
+        if (
+            abs(signed_camera_x_response)
+            < SINGLE_AXIS_CALIBRATION_MIN_RESPONSE_PIXELS
+            or min(plus_x_abs_error, minus_x_abs_error)
+            >= initial_abs_error
+        ):
+            print(
+                "Calibration response does not identify a Camera-X direction "
+                "that reduces |ex|: FAIL / HOLD."
+            )
+            servo.request_hold("FAIL: CALIBRATION DIRECTION / HOLD")
+            return None
+
+        # The P law below is delta_x = sign * Kp * ex.  The sign is derived
+        # from the measured d(ex)/d(Camera-X), never guessed from the setup.
+        servo.control_direction = -1 if signed_camera_x_response > 0 else 1
+        improving_axis = "+X" if plus_x_abs_error < minus_x_abs_error else "-X"
+        print(
+            f"Correct direction sign: {servo.control_direction:+d}; "
+            f"{improving_axis} reduced |ex| more; "
+            f"d(ex)/dX samples: +X={plus_x_response:+d}, "
+            f"-X={minus_x_response:+d}."
+        )
+        servo.state = "CALIBRATION: RESTORE AFTER -X"
+        return _request_calibration_restore(servo, "Calibration restore after -X")
+
+    if servo.state == "CALIBRATION: RESTORE AFTER -X":
+        servo.state = "P CONTROL: EX ONLY"
+        servo.previous_abs_ex = None
+        servo.control_started_at = time.monotonic()
+        print("Direction Calibration: PASS. Starting horizontal ex-only P control.")
+
+    if servo.state != "P CONTROL: EX ONLY":
+        return None
+
+    absolute_ex = abs(ex)
+    if absolute_ex < SINGLE_AXIS_SERVO_EX_GOAL_PIXELS:
+        convergence_time = (
+            time.monotonic() - servo.control_started_at
+            if servo.control_started_at is not None
+            else 0.0
+        )
+        print(
+            "Servo State = HORIZONTAL CENTERED; "
+            f"Initial ex={servo.initial_ex}, Final ex={ex}, "
+            f"Convergence time={convergence_time:.2f} s."
+        )
+        servo.request_hold("HORIZONTAL CENTERED")
+        return None
+    if servo.previous_abs_ex is not None and absolute_ex > servo.previous_abs_ex:
+        servo.consecutive_error_increases += 1
+        if (
+            servo.consecutive_error_increases
+            >= SINGLE_AXIS_MAX_CONSECUTIVE_ERROR_INCREASES
+        ):
+            print(
+                "Servo State = DIVERGING; |ex| increased on three consecutive "
+                "completed P steps. Robot = HOLD."
+            )
+            print("Recent 5 horizontal control samples (ex, command, camera position):")
+            for history_ex, history_command, history_camera_position in (
+                servo.recent_control_history
+            ):
+                print(
+                    f"  ex={history_ex}, command={history_command:.6f} m, "
+                    "camera position="
+                    f"{[round(value, 6) for value in history_camera_position]}"
+                )
+            servo.request_hold("DIVERGING")
+            return None
+    else:
+        servo.consecutive_error_increases = 0
+    servo.previous_abs_ex = absolute_ex
+    if servo.control_steps >= SINGLE_AXIS_MAX_CONTROL_STEPS:
+        print("Single-axis control step limit reached: HOLD.")
+        servo.request_hold("HOLD: STEP LIMIT")
+        return None
+
+    assert servo.control_direction is not None
+    raw_delta_x = SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL * ex
+    clipped_delta_x = max(
+        -SINGLE_AXIS_SERVO_MAX_STEP_METRES,
+        min(SINGLE_AXIS_SERVO_MAX_STEP_METRES, raw_delta_x),
+    )
+    commanded_delta_x = servo.control_direction * clipped_delta_x
+    servo.control_steps += 1
+    print(
+        f"P control {servo.control_steps}: u={u}, cx={detection.image_center[0]}, "
+        f"ex={ex}, abs(ex)={absolute_ex}, "
+        f"delta command=[{commanded_delta_x:.6f}, 0.000000, 0.000000] m, "
+        "servo state=P CONTROL: EX ONLY"
+    )
+    return _request_camera_x_motion(
+        servo,
+        robot_id,
+        f"P step {servo.control_steps}: ex={ex} px, ey={ey} px",
+        commanded_delta_x,
+        locked_joint_indices,
+        locked_initial_positions,
+        client_id,
+    )
+
+
 def _smoothstep(progress: float) -> float:
     """Ease a zero-to-one trajectory progress with zero endpoint velocity."""
     bounded_progress = max(0.0, min(1.0, progress))
@@ -910,6 +1505,169 @@ def apply_constrained_arm_position_control(
         constrained_waypoints,
         client_id,
     )
+
+
+def get_current_arm_hold_targets(
+    robot_id: int,
+    arm_joint_indices: Sequence[int],
+    client_id: int,
+) -> list[float]:
+    """Capture the current joint pose for an active-joint HOLD command.
+
+    The constrained controller still overrides locked joints with their
+    immutable startup targets. Active joints use these live measurements, so
+    a stopped visual-servo command holds its reached pose rather than home.
+    """
+    return [
+        p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+        for joint_index in arm_joint_indices
+    ]
+
+
+def capture_active_joint_hold_targets(
+    robot_id: int,
+    active_joint_indices: Sequence[int],
+    client_id: int,
+) -> dict[int, float]:
+    """Save the active joints' actual reached angles as their HOLD targets."""
+    return {
+        joint_index: p.getJointState(
+            robot_id,
+            joint_index,
+            physicsClientId=client_id,
+        )[0]
+        for joint_index in active_joint_indices
+    }
+
+
+def build_hold_joint_targets(
+    arm_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    active_hold_targets: dict[int, float],
+) -> list[float]:
+    """Build the seven-joint HOLD target without using active startup angles."""
+    targets = []
+    for joint_index in arm_joint_indices:
+        if joint_index in locked_initial_positions:
+            targets.append(locked_initial_positions[joint_index])
+        else:
+            try:
+                targets.append(active_hold_targets[joint_index])
+            except KeyError as error:
+                raise RuntimeError(
+                    f"Missing current HOLD target for active joint {joint_index}."
+                ) from error
+    return targets
+
+
+def print_active_joint_hold_status(
+    servo_state: str,
+    robot_id: int,
+    active_joint_indices: Sequence[int],
+    initial_arm_positions: dict[int, float],
+    active_hold_targets: dict[int, float],
+    commanded_joint_targets: Sequence[float],
+    arm_joint_indices: Sequence[int],
+    client_id: int,
+) -> None:
+    """Report the live active-joint HOLD source and detect stale home targets."""
+    target_by_joint = dict(zip(arm_joint_indices, commanded_joint_targets))
+    print(f"Servo State: {servo_state}")
+    for joint_index in active_joint_indices:
+        joint_name = _decode_name(
+            p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]
+        )
+        current_position = p.getJointState(
+            robot_id,
+            joint_index,
+            physicsClientId=client_id,
+        )[0]
+        initial_position = initial_arm_positions[joint_index]
+        hold_target = active_hold_targets[joint_index]
+        commanded_target = target_by_joint[joint_index]
+        print(
+            f"  {joint_name}: current q={current_position:.6f}, "
+            f"commanded target q={commanded_target:.6f}, "
+            f"initial q={initial_position:.6f}, "
+            f"hold target q={hold_target:.6f}"
+        )
+        if (
+            abs(commanded_target - initial_position) < 1e-9
+            and abs(hold_target - initial_position) >= 1e-9
+        ):
+            print(
+                "  ERROR: active HOLD target was overwritten by initial q; "
+                "inspect the main-loop command source."
+            )
+
+
+def print_visual_servo_current_pose_takeover(
+    robot_id: int,
+    arm_joint_indices: Sequence[int],
+    initial_arm_positions: dict[int, float],
+    detection: RedTargetDetection,
+    first_command: CameraAxisMotionCommand,
+    client_id: int,
+) -> bool:
+    """Print evidence that the first P target was derived from current C pose."""
+    current_joint_positions = {
+        _decode_name(p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]):
+        p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+        for joint_index in arm_joint_indices
+    }
+    initial_joint_positions = {
+        _decode_name(p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]):
+        initial_arm_positions[joint_index]
+        for joint_index in arm_joint_indices
+    }
+    current_end_effector_position, _ = get_camera_reference_pose(robot_id, client_id)
+    current_camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+    command_source_camera_position = [
+        target - delta
+        for target, delta in zip(
+            first_command.target_camera_position,
+            first_command.camera_delta_w,
+        )
+    ]
+    source_error = sqrt(
+        sum(
+            (current - source) ** 2
+            for current, source in zip(
+                current_camera_position,
+                command_source_camera_position,
+            )
+        )
+    )
+    source_is_current_pose = source_error < 1e-8
+    active_joint_target = {
+        _decode_name(p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]):
+        target_position
+        for joint_index, target_position in zip(arm_joint_indices, first_command.joint_targets)
+        if _decode_name(p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1])
+        not in BASELINE_LOCKED_JOINT_NAMES
+    }
+    assert detection.centroid is not None
+    assert detection.pixel_error is not None
+    print("\nVisual Servo first takeover:")
+    print("  Current q:", {name: round(value, 6) for name, value in current_joint_positions.items()})
+    print("  Initial q:", {name: round(value, 6) for name, value in initial_joint_positions.items()})
+    print("  Current EE position:", [round(value, 6) for value in current_end_effector_position])
+    print("  Current Camera position:", [round(value, 6) for value in current_camera_position])
+    print("  Target pixel:", detection.centroid)
+    print("  ex:", detection.pixel_error[0])
+    print(
+        "  First servo target: Camera position=",
+        [round(value, 6) for value in first_command.target_camera_position],
+        "; active joint targets=",
+        {name: round(value, 6) for name, value in active_joint_target.items()},
+    )
+    print("  Visual Servo Start Source: CURRENT POSE")
+    print(
+        "  First Servo Command Based On Current Pose:",
+        "PASS" if source_is_current_pose else "FAIL",
+        f"(source error={source_error:.12f} m)",
+    )
+    return source_is_current_pose
 
 
 def get_locked_joint_deviations(
@@ -1379,7 +2137,8 @@ def update_live_eye_in_hand_camera(
     simulation_step: int,
     client_id: int,
     camera_display: EyeInHandRgbDisplay,
-) -> None:
+    servo_state: str = "INITIALIZING / HOLD",
+) -> RedTargetDetection | None:
     """Refresh the fixed hand-eye RGB camera from the latest E pose.
 
     This function is called after every physics step in both HOLD and MOVE.
@@ -1393,14 +2152,21 @@ def update_live_eye_in_hand_camera(
         client_id,
     )
     if simulation_step % CAMERA_UPDATE_INTERVAL_STEPS != 0:
-        return
+        return None
     live_frame = render_live_eye_in_hand_rgb_frame(
         camera_position,
         camera_orientation,
         client_id,
     )
     red_detection = detect_red_target_from_live_rgb(live_frame)
-    camera_display.show(live_frame, red_detection.annotated_rgba_buffer)
+    camera_display.show(
+        live_frame,
+        add_servo_state_overlay(
+            live_frame,
+            red_detection.annotated_rgba_buffer,
+            servo_state,
+        ),
+    )
     if simulation_step % TARGET_DETECTION_PRINT_INTERVAL_STEPS == 0:
         if red_detection.detected:
             assert red_detection.centroid is not None
@@ -1421,6 +2187,7 @@ def update_live_eye_in_hand_camera(
                 "Red target detection: Target not detected; "
                 f"image center = {red_detection.image_center}"
             )
+    return red_detection
 
 
 def update_motion_debug_text(
@@ -1736,6 +2503,11 @@ def run_rgb_detection_hold_gui() -> None:
             for joint_name, joint_index in arm_joint_names.items()
             if joint_index not in locked_joint_indices
         ]
+        active_joint_indices = [
+            joint_index
+            for joint_index in arm_joint_indices
+            if joint_index not in locked_joint_indices
+        ]
         print("Stage 3.1 baseline locked joints:", list(BASELINE_LOCKED_JOINT_NAMES))
         print("Stage 3.1 baseline active joints:", active_joint_names)
 
@@ -1759,29 +2531,18 @@ def run_rgb_detection_hold_gui() -> None:
             camera_offset_candidate_debug_item_ids,
         )
         debug_text_id = update_motion_debug_text(
-            f"Initializing: Robot HOLD | Camera ACTIVE ({STARTUP_PAUSE_SECONDS:.0f} s)",
+            "Initializing: Robot HOLD at CURRENT pose | Camera ACTIVE",
             None,
             client_id,
         )
         print("Initialization phase:")
-        print("Robot: HOLD")
+        print("Robot: HOLD at CURRENT pose")
         print("Eye-in-Hand Camera: ACTIVE")
-        print(f"Holding initial Panda pose for {STARTUP_PAUSE_SECONDS:.1f} s.")
-        if not wait_with_static_arm(
-            STARTUP_PAUSE_SECONDS,
-            robot_id,
-            arm_joint_indices,
-            initial_arm_positions,
-            locked_initial_positions,
-            client_id,
-            camera_axis_debug_item_ids,
-            camera_offset_candidate_debug_item_ids,
-            camera_display,
-        ):
-            return
+        print("Startup initial-pose motion: DISABLED")
+        print("Waiting only for the first valid Eye-in-Hand RGB detection.")
 
         debug_text_id = update_motion_debug_text(
-            "RGB detection active: holding initial Panda pose",
+            "Stage 6A: Camera-X calibration waiting for RGB target",
             debug_text_id,
             client_id,
         )
@@ -1795,28 +2556,79 @@ def run_rgb_detection_hold_gui() -> None:
             f"{'ENABLED' if VISUAL_SERVO_MOTION_ENABLED else 'NOT YET ENABLED'}"
         )
         print(
-            "RGB detection is observation-only. The detected (ex, ey) is "
-            "available for a future visual-servo controller; no motion command "
-            "is generated in this stage."
+            "Stage 6A uses ex only. ey remains visible for observation and is "
+            "never used to create a robot command."
+        )
+        print(
+            "If Stage 6A is safely HOLDing after DIVERGING/TARGET LOST, press R "
+            "to calibrate Camera-X again from the current active-joint pose."
         )
         print("Close the PyBullet GUI window to finish the example.")
 
-        hold_targets = [
-            initial_arm_positions[joint_index] for joint_index in arm_joint_indices
-        ]
+        # The default path never commands startup active-joint targets. From
+        # the first control step onward, active HOLD targets are measured q.
+        active_hold_targets = capture_active_joint_hold_targets(
+            robot_id,
+            active_joint_indices,
+            client_id,
+        )
+        commanded_joint_targets = build_hold_joint_targets(
+            arm_joint_indices,
+            locked_initial_positions,
+            active_hold_targets,
+        )
+        single_axis_servo = SingleAxisVisualServo(
+            state=(
+                "CALIBRATION: WAITING FOR TARGET"
+                if VISUAL_SERVO_MOTION_ENABLED
+                else "HOLD: VISUAL SERVO PAUSED"
+            )
+        )
         simulation_step = 0
         status_interval_steps = max(
             1,
             round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
         )
         while p.isConnected(client_id):
-            # Holding targets are the startup angles, not an IK solution. The
-            # constrained controller re-applies the recorded locked targets at
-            # every step while the active joints remain at their start angles.
+            if (
+                VISUAL_SERVO_MOTION_ENABLED
+                and single_axis_servo.is_terminal
+                and horizontal_recalibration_requested(client_id)
+            ):
+                # Do not reset any Panda joint.  The current reached active
+                # pose becomes HOLD while a fresh local +/-2 mm sign test is
+                # performed from that exact pose.
+                active_hold_targets = capture_active_joint_hold_targets(
+                    robot_id,
+                    active_joint_indices,
+                    client_id,
+                )
+                commanded_joint_targets = build_hold_joint_targets(
+                    arm_joint_indices,
+                    locked_initial_positions,
+                    active_hold_targets,
+                )
+                single_axis_servo = SingleAxisVisualServo()
+                debug_text_id = update_motion_debug_text(
+                    "Stage 6A: recalibrating Camera-X from current HOLD pose",
+                    debug_text_id,
+                    client_id,
+                )
+                print(
+                    "Stage 6A recalibration requested: Robot HOLD; "
+                    "continuous P loop paused for current-pose sign calibration."
+                )
+            # In PAUSED/HOLD, active_hold_targets is intentionally immutable:
+            # it was captured after initialization (or when the servo entered
+            # HOLD).  Every control step below therefore holds that reached
+            # pose, never the program-start active-joint angles.
+            # Before the first RGB-calibration result this is a pure HOLD. Once
+            # calibrated, only Stage 6A ex-derived Camera-X commands may
+            # replace these active-joint targets.
             apply_constrained_arm_position_control(
                 robot_id,
                 arm_joint_indices,
-                hold_targets,
+                commanded_joint_targets,
                 locked_initial_positions,
                 client_id,
             )
@@ -1831,16 +2643,92 @@ def run_rgb_detection_hold_gui() -> None:
                 client_id,
                 camera_offset_candidate_debug_item_ids,
             )
-            update_live_eye_in_hand_camera(
+            detection = update_live_eye_in_hand_camera(
                 robot_id,
                 simulation_step,
                 client_id,
                 camera_display,
+                single_axis_servo.state,
             )
+            if detection is not None and VISUAL_SERVO_MOTION_ENABLED:
+                previous_servo_state = single_axis_servo.state
+                new_command = update_single_axis_visual_servo(
+                    single_axis_servo,
+                    detection,
+                    robot_id,
+                    locked_joint_indices,
+                    locked_initial_positions,
+                    client_id,
+                )
+                if single_axis_servo.motion_completed:
+                    # A completed calibration/P waypoint becomes the newest
+                    # active HOLD pose before another command is considered.
+                    # The saved values come from measured joint state, never
+                    # from the program-start active-joint angles.
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    single_axis_servo.motion_completed = False
+                if new_command is not None:
+                    if (
+                        new_command.label.startswith("P step")
+                        and not single_axis_servo.first_servo_command_logged
+                    ):
+                        current_pose_source_ok = print_visual_servo_current_pose_takeover(
+                            robot_id,
+                            arm_joint_indices,
+                            initial_arm_positions,
+                            detection,
+                            new_command,
+                            client_id,
+                        )
+                        single_axis_servo.first_servo_command_logged = True
+                        if not current_pose_source_ok:
+                            print(
+                                "FAIL: first Visual Servo target was not derived "
+                                "from the current camera pose. Robot HOLD."
+                            )
+                            single_axis_servo.request_hold(
+                                "FAIL: FIRST TARGET NOT CURRENT POSE / HOLD"
+                            )
+                    if not single_axis_servo.hold_requested:
+                        commanded_joint_targets = list(new_command.joint_targets)
+                if single_axis_servo.hold_requested:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    commanded_joint_targets = build_hold_joint_targets(
+                        arm_joint_indices,
+                        locked_initial_positions,
+                        active_hold_targets,
+                    )
+                    single_axis_servo.hold_requested = False
+                if single_axis_servo.state != previous_servo_state:
+                    debug_text_id = update_motion_debug_text(
+                        single_axis_servo.state,
+                        debug_text_id,
+                        client_id,
+                    )
             simulation_step += 1
             if simulation_step % status_interval_steps == 0:
+                report_phase = get_locked_joint_report_phase(single_axis_servo)
+                if report_phase == "HOLD":
+                    print_active_joint_hold_status(
+                        single_axis_servo.state,
+                        robot_id,
+                        active_joint_indices,
+                        initial_arm_positions,
+                        active_hold_targets,
+                        commanded_joint_targets,
+                        arm_joint_indices,
+                        client_id,
+                    )
                 print_locked_joint_status(
-                    "HOLD",
+                    report_phase,
                     robot_id,
                     locked_initial_positions,
                     client_id,

@@ -558,6 +558,16 @@ def detect_red_target_from_live_rgb(frame: LiveCameraFrame) -> RedTargetDetectio
         2,
         cv2.LINE_AA,
     )
+    cv2.putText(
+        annotated_bgr,
+        f"ex: {pixel_error[0]}  ey: {pixel_error[1]}",
+        (max(8, x), min(frame.image_height - 12, y + height + 24)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
     annotated_rgba = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGBA).tobytes()
     return RedTargetDetection(
         detected=True,
@@ -568,6 +578,43 @@ def detect_red_target_from_live_rgb(frame: LiveCameraFrame) -> RedTargetDetectio
         pixel_error=pixel_error,
         annotated_rgba_buffer=annotated_rgba,
     )
+
+
+def add_servo_state_overlay(
+    frame: LiveCameraFrame,
+    annotated_rgba_buffer: object,
+    servo_state: str,
+) -> bytes:
+    """Overlay the current Stage 6A state without changing RGB detection."""
+    rgba_bytes = _rgba_buffer_to_bytes(annotated_rgba_buffer)
+    expected_byte_count = frame.image_width * frame.image_height * 4
+    if len(rgba_bytes) != expected_byte_count:
+        raise RuntimeError(
+            "Annotated Eye-in-Hand RGBA buffer has unexpected length: "
+            f"expected {expected_byte_count}, got {len(rgba_bytes)}."
+        )
+    rgba_image = np.frombuffer(rgba_bytes, dtype=np.uint8).reshape(
+        (frame.image_height, frame.image_width, 4)
+    )
+    annotated_bgr = cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGR)
+    cv2.rectangle(
+        annotated_bgr,
+        (8, frame.image_height - 42),
+        (min(frame.image_width - 8, 620), frame.image_height - 8),
+        (30, 30, 30),
+        thickness=-1,
+    )
+    cv2.putText(
+        annotated_bgr,
+        f"Servo: {servo_state}",
+        (16, frame.image_height - 17),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGBA).tobytes()
 
 
 class EyeInHandRgbDisplay:
