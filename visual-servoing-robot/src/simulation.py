@@ -106,6 +106,24 @@ SINGLE_AXIS_MAX_CONTROL_STEPS = 120
 VERTICAL_SERVO_KP_METRES_PER_PIXEL = SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL
 VERTICAL_SERVO_MAX_STEP_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES
 VERTICAL_SERVO_GOAL_PIXELS = SINGLE_AXIS_SERVO_EX_GOAL_PIXELS
+# Measured by the accepted Stage 6A/6B +/-2 mm RGB calibration at the current
+# baseline start pose.  Stage 6C consumes these values directly and does not
+# repeat or guess either sign.
+STAGE6A_CALIBRATED_HORIZONTAL_SIGN = -1
+STAGE6B_CALIBRATED_VERTICAL_SIGN = -1
+TWO_D_TOL_X_PIXELS = SINGLE_AXIS_SERVO_EX_GOAL_PIXELS
+TWO_D_TOL_Y_PIXELS = VERTICAL_SERVO_GOAL_PIXELS
+TWO_D_ERROR_NORM_INCREASE_TOLERANCE_PIXELS = 3.0
+TWO_D_MAX_CONSECUTIVE_NORM_INCREASES = 3
+TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES = 10.0
+# Each axis retains its Stage 6A/6B 2 mm maximum.  A simultaneous command is
+# additionally norm-limited to 2 mm, preventing its 2.83 mm resultant from
+# violating the accepted constrained-IK tolerance. This is a safety reduction,
+# never a speed increase or a change to either single-axis parameter.
+TWO_D_MAX_RESULTANT_STEP_METRES = min(
+    SINGLE_AXIS_SERVO_MAX_STEP_METRES,
+    VERTICAL_SERVO_MAX_STEP_METRES,
+)
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -152,9 +170,9 @@ SECONDARY_CAMERA_REFERENCE_TARGET = (
     (0.092, -0.092, 1.078),
 )
 LEGACY_FIXED_MOTION_ENABLED = False
-# Select exactly one vision-control axis.  Stage 6B intentionally leaves
-# Stage 6A's horizontal ex controller defined but disabled at runtime.
-VISUAL_SERVO_MODE = "VERTICAL_EY"
+# Select one accepted Stage 6 path. Stage 6C combines only the existing
+# calibrated Camera-X/ex and Camera-Y/ey axes; it does not redefine either.
+VISUAL_SERVO_MODE = "TWO_D"
 VISUAL_SERVO_MOTION_ENABLED = True
 # This is the accepted Stage 3.1 baseline.  The values are recorded from the
 # loaded Panda at startup and applied on every control step; they are not IK
@@ -345,6 +363,99 @@ class VerticalVisualServo:
         del self.recent_control_history[:-5]
 
 
+@dataclass
+class TwoDimensionalVisualServo:
+    """Stage 6C state machine: simultaneous calibrated Camera-X/Y tracking."""
+
+    state: str = "2D WAITING FOR TARGET"
+    initial_pixel: tuple[int, int] | None = None
+    initial_ex: int | None = None
+    initial_ey: int | None = None
+    initial_error_norm: float | None = None
+    horizontal_sign: int = STAGE6A_CALIBRATED_HORIZONTAL_SIGN
+    vertical_sign: int = STAGE6B_CALIBRATED_VERTICAL_SIGN
+    pending_command: CameraAxisMotionCommand | None = None
+    pending_camera_orientation: tuple[float, float, float, float] | None = None
+    pending_render_frames: int = 0
+    motion_completed: bool = False
+    previous_error_norm: float | None = None
+    consecutive_norm_increases: int = 0
+    control_steps: int = 0
+    control_started_at: float | None = None
+    recent_control_history: list[
+        tuple[int, int, float, float, float, tuple[float, float, float]]
+    ] = field(default_factory=list)
+    max_camera_orientation_step_degrees: float = 0.0
+    orientation_stable: bool = True
+    last_ex: int | None = None
+    last_ey: int | None = None
+    last_error_norm: float | None = None
+    last_delta_x: float = 0.0
+    last_delta_y: float = 0.0
+    first_servo_command_logged: bool = False
+    hold_requested: bool = False
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state.startswith(
+            (
+                "2D CENTERED",
+                "DIVERGING",
+                "FAIL",
+                "TARGET LOST",
+                "HOLD",
+                "OVERSHOOT",
+            )
+        )
+
+    def request_hold(self, state: str) -> None:
+        self.state = state
+        self.pending_command = None
+        self.pending_camera_orientation = None
+        self.hold_requested = True
+
+    def record_completed_p_step(
+        self,
+        ex: int,
+        ey: int,
+        error_norm: float,
+        delta_x: float,
+        delta_y: float,
+        camera_position: Sequence[float],
+    ) -> None:
+        """Keep recent 2D samples for the norm-based divergence diagnosis."""
+        self.recent_control_history.append(
+            (
+                ex,
+                ey,
+                error_norm,
+                delta_x,
+                delta_y,
+                tuple(camera_position),
+            )
+        )
+        del self.recent_control_history[:-5]
+
+
+def get_visual_servo_overlay_text(
+    servo: SingleAxisVisualServo | VerticalVisualServo | TwoDimensionalVisualServo,
+) -> str:
+    """Return concise RGB-overlay status without affecting detection/control."""
+    if not isinstance(servo, TwoDimensionalVisualServo):
+        return servo.state
+    if (
+        servo.last_ex is None
+        or servo.last_ey is None
+        or servo.last_error_norm is None
+    ):
+        return servo.state
+    return (
+        f"{servo.state} | ex={servo.last_ex} ey={servo.last_ey} "
+        f"norm={servo.last_error_norm:.1f} dx={servo.last_delta_x:.4f} "
+        f"dy={servo.last_delta_y:.4f}"
+    )
+
+
 def get_single_axis_adaptive_step_limit(absolute_ex: int | float) -> float:
     """Return the Camera-X P-step limit for the current image error.
 
@@ -386,7 +497,7 @@ def calculate_vertical_adaptive_p_step(ey: int | float) -> tuple[float, float, f
 
 
 def get_locked_joint_report_phase(
-    servo: SingleAxisVisualServo | VerticalVisualServo,
+    servo: SingleAxisVisualServo | VerticalVisualServo | TwoDimensionalVisualServo,
 ) -> str:
     """Map Stage 6A detail states onto the strict HOLD/MOVE report contract."""
     return "MOVE" if servo.pending_command is not None and not servo.is_terminal else "HOLD"
@@ -1309,6 +1420,68 @@ def plan_camera_y_axis_motion(
     )
 
 
+def plan_camera_xy_motion(
+    robot_id: int,
+    label: str,
+    camera_delta_x: float,
+    camera_delta_y: float,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand:
+    """Plan one current-pose-relative Stage 6C Camera-frame XY increment."""
+    if abs(camera_delta_x) > SINGLE_AXIS_SERVO_MAX_STEP_METRES + 1e-12:
+        raise ValueError(
+            "A Stage 6C Camera X component may not exceed "
+            f"{SINGLE_AXIS_SERVO_MAX_STEP_METRES:.4f} m."
+        )
+    if abs(camera_delta_y) > VERTICAL_SERVO_MAX_STEP_METRES + 1e-12:
+        raise ValueError(
+            "A Stage 6C Camera Y component may not exceed "
+            f"{VERTICAL_SERVO_MAX_STEP_METRES:.4f} m."
+        )
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    camera_delta_c = (camera_delta_x, camera_delta_y, 0.0)
+    camera_delta_w = camera_frame_delta_to_world(
+        camera_position,
+        camera_orientation,
+        camera_delta_c,
+    )
+    target_camera_position = [
+        position + delta
+        for position, delta in zip(camera_position, camera_delta_w)
+    ]
+    _, joint_targets, camera_target_error = calculate_constrained_camera_position_ik(
+        robot_id,
+        target_camera_position,
+        locked_joint_indices,
+        locked_initial_positions,
+        client_id,
+    )
+    if camera_target_error > SINGLE_AXIS_CAMERA_TARGET_TOLERANCE_METRES:
+        raise RuntimeError(
+            "Constrained Camera XY target is not reachable within tolerance: "
+            f"{camera_target_error:.6f} m."
+        )
+    print(
+        f"{label}: delta_p_C={list(camera_delta_c)} m; "
+        f"delta_p_W={[round(value, 6) for value in camera_delta_w]} m; "
+        f"target C={[round(value, 6) for value in target_camera_position]} m; "
+        f"IK error={camera_target_error:.6f} m"
+    )
+    return CameraAxisMotionCommand(
+        label=label,
+        camera_delta_c=camera_delta_c,
+        camera_delta_w=tuple(camera_delta_w),
+        target_camera_position=tuple(target_camera_position),
+        joint_targets=tuple(joint_targets),
+        camera_target_error=camera_target_error,
+    )
+
+
 def _request_camera_x_motion(
     servo: SingleAxisVisualServo,
     robot_id: int,
@@ -1361,6 +1534,38 @@ def _request_camera_y_motion(
         servo.request_hold("FAIL: CAMERA IK / HOLD")
         return None
     servo.pending_command = command
+    servo.pending_render_frames = 0
+    return command
+
+
+def _request_camera_xy_motion(
+    servo: TwoDimensionalVisualServo,
+    robot_id: int,
+    label: str,
+    camera_delta_x: float,
+    camera_delta_y: float,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand | None:
+    """Plan one Stage 6C XY command or safely HOLD if constrained IK fails."""
+    try:
+        command = plan_camera_xy_motion(
+            robot_id,
+            label,
+            camera_delta_x,
+            camera_delta_y,
+            locked_joint_indices,
+            locked_initial_positions,
+            client_id,
+        )
+    except RuntimeError as error:
+        print(f"{label}: 2D control FAIL / HOLD ({error})")
+        servo.request_hold("FAIL: CAMERA IK / HOLD")
+        return None
+    _, camera_orientation = get_camera_optical_center_pose(robot_id, client_id)
+    servo.pending_command = command
+    servo.pending_camera_orientation = tuple(camera_orientation)
     servo.pending_render_frames = 0
     return command
 
@@ -1924,6 +2129,243 @@ def update_vertical_visual_servo(
     )
 
 
+def _quaternion_distance_degrees(
+    first_orientation: Sequence[float],
+    second_orientation: Sequence[float],
+) -> float:
+    """Return the smallest rotation angle between two unit quaternions."""
+    dot_product = abs(
+        sum(first * second for first, second in zip(first_orientation, second_orientation))
+    )
+    bounded_dot_product = max(-1.0, min(1.0, dot_product))
+    return degrees(2.0 * acos(bounded_dot_product))
+
+
+def update_two_dimensional_visual_servo(
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+    robot_id: int,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand | None:
+    """Advance Stage 6C's current-pose-relative calibrated XY P controller."""
+    if servo.is_terminal:
+        return None
+    if not detection.detected:
+        print("Target lost: 2D control paused, HOLD current pose.")
+        servo.last_delta_x = 0.0
+        servo.last_delta_y = 0.0
+        servo.request_hold("TARGET LOST / HOLD")
+        return None
+
+    assert detection.centroid is not None
+    assert detection.pixel_error is not None
+    u, v = detection.centroid
+    ex, ey = detection.pixel_error
+    error_norm = sqrt(ex * ex + ey * ey)
+    servo.last_ex = ex
+    servo.last_ey = ey
+    servo.last_error_norm = error_norm
+
+    if servo.pending_command is not None:
+        active_joint_error = get_active_joint_target_error(
+            robot_id,
+            servo.pending_command.joint_targets,
+            locked_joint_indices,
+            client_id,
+        )
+        servo.pending_render_frames += 1
+        if servo.pending_render_frames < SINGLE_AXIS_MIN_WAYPOINT_RENDER_FRAMES:
+            return None
+        if active_joint_error > SINGLE_AXIS_ACTIVE_JOINT_TARGET_TOLERANCE_RAD:
+            if servo.pending_render_frames > SINGLE_AXIS_COMMAND_TIMEOUT_RENDER_FRAMES:
+                print(
+                    f"{servo.pending_command.label}: 2D control FAIL / HOLD "
+                    "(active-joint waypoint timeout, "
+                    f"error={active_joint_error:.6f} rad)."
+                )
+                servo.request_hold("FAIL: ACTIVE WAYPOINT TIMEOUT / HOLD")
+            return None
+        current_camera_position, current_camera_orientation = get_camera_optical_center_pose(
+            robot_id,
+            client_id,
+        )
+        motion_start_position = [
+            target - delta
+            for target, delta in zip(
+                servo.pending_command.target_camera_position,
+                servo.pending_command.camera_delta_w,
+            )
+        ]
+        actual_camera_displacement = [
+            actual - start
+            for actual, start in zip(
+                current_camera_position,
+                motion_start_position,
+            )
+        ]
+        orientation_step_degrees = 0.0
+        if servo.pending_camera_orientation is not None:
+            orientation_step_degrees = _quaternion_distance_degrees(
+                servo.pending_camera_orientation,
+                current_camera_orientation,
+            )
+            servo.max_camera_orientation_step_degrees = max(
+                servo.max_camera_orientation_step_degrees,
+                orientation_step_degrees,
+            )
+            if orientation_step_degrees > TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES:
+                servo.orientation_stable = False
+                print(
+                    "Camera orientation warning: one Stage 6C waypoint changed "
+                    f"world camera orientation by {orientation_step_degrees:.3f} deg "
+                    f"(limit {TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES:.1f} deg)."
+                )
+        print(
+            f"{servo.pending_command.label}: reached active-joint waypoint; "
+            f"active joint error={active_joint_error:.6f} rad; "
+            f"ex={ex}, ey={ey}, error_norm={error_norm:.3f}; "
+            "actual camera displacement="
+            f"{[round(value, 6) for value in actual_camera_displacement]} m; "
+            f"camera orientation step={orientation_step_degrees:.3f} deg."
+        )
+        servo.record_completed_p_step(
+            ex,
+            ey,
+            error_norm,
+            servo.pending_command.camera_delta_c[0],
+            servo.pending_command.camera_delta_c[1],
+            current_camera_position,
+        )
+        servo.pending_command = None
+        servo.pending_camera_orientation = None
+        servo.pending_render_frames = 0
+        servo.motion_completed = True
+
+    if servo.state == "2D WAITING FOR TARGET":
+        servo.initial_pixel = (u, v)
+        servo.initial_ex = ex
+        servo.initial_ey = ey
+        servo.initial_error_norm = error_norm
+        servo.previous_error_norm = None
+        servo.control_started_at = time.monotonic()
+        servo.state = "2D TRACKING"
+        print(
+            "Stage 6C start from CURRENT pose: "
+            f"target=({u}, {v}), ex={ex}, ey={ey}, error_norm={error_norm:.3f}; "
+            f"using verified signs X={servo.horizontal_sign:+d}, "
+            f"Y={servo.vertical_sign:+d}."
+        )
+
+    if servo.state != "2D TRACKING":
+        return None
+
+    if abs(ex) < TWO_D_TOL_X_PIXELS and abs(ey) < TWO_D_TOL_Y_PIXELS:
+        convergence_time = (
+            time.monotonic() - servo.control_started_at
+            if servo.control_started_at is not None
+            else 0.0
+        )
+        servo.last_delta_x = 0.0
+        servo.last_delta_y = 0.0
+        print(
+            "Servo State = 2D CENTERED; "
+            f"Initial (ex, ey)=({servo.initial_ex}, {servo.initial_ey}), "
+            f"Final (ex, ey)=({ex}, {ey}), error_norm={error_norm:.3f}, "
+            f"Convergence time={convergence_time:.2f} s."
+        )
+        servo.request_hold("2D CENTERED")
+        return None
+
+    if (
+        servo.previous_error_norm is not None
+        and error_norm
+        > servo.previous_error_norm + TWO_D_ERROR_NORM_INCREASE_TOLERANCE_PIXELS
+    ):
+        servo.consecutive_norm_increases += 1
+        if (
+            servo.consecutive_norm_increases >= TWO_D_MAX_CONSECUTIVE_NORM_INCREASES
+            and len(servo.recent_control_history) >= 5
+        ):
+            print(
+                "Servo State = DIVERGING; 2D error norm increased materially on "
+                "three consecutive completed control periods. Robot = HOLD."
+            )
+            print("Recent 5 Stage 6C samples (ex, ey, norm, dx, dy, camera position):")
+            for sample_ex, sample_ey, sample_norm, sample_dx, sample_dy, sample_camera in (
+                servo.recent_control_history
+            ):
+                print(
+                    f"  ex={sample_ex}, ey={sample_ey}, norm={sample_norm:.3f}, "
+                    f"dx={sample_dx:.6f} m, dy={sample_dy:.6f} m, "
+                    "camera position="
+                    f"{[round(value, 6) for value in sample_camera]}"
+                )
+            servo.last_delta_x = 0.0
+            servo.last_delta_y = 0.0
+            servo.request_hold("DIVERGING")
+            return None
+    else:
+        servo.consecutive_norm_increases = 0
+    servo.previous_error_norm = error_norm
+
+    if servo.control_steps >= SINGLE_AXIS_MAX_CONTROL_STEPS:
+        print("Stage 6C control step limit reached: HOLD.")
+        servo.last_delta_x = 0.0
+        servo.last_delta_y = 0.0
+        servo.request_hold("HOLD: STEP LIMIT")
+        return None
+
+    if abs(ex) < TWO_D_TOL_X_PIXELS:
+        raw_delta_x = 0.0
+        applied_delta_x = 0.0
+    else:
+        raw_delta_x, _, applied_delta_x = calculate_single_axis_adaptive_p_step(ex)
+    if abs(ey) < TWO_D_TOL_Y_PIXELS:
+        raw_delta_y = 0.0
+        applied_delta_y = 0.0
+    else:
+        raw_delta_y, _, applied_delta_y = calculate_vertical_adaptive_p_step(ey)
+
+    commanded_delta_x = servo.horizontal_sign * applied_delta_x
+    commanded_delta_y = servo.vertical_sign * applied_delta_y
+    resultant_step = sqrt(
+        commanded_delta_x * commanded_delta_x
+        + commanded_delta_y * commanded_delta_y
+    )
+    if resultant_step > TWO_D_MAX_RESULTANT_STEP_METRES:
+        resultant_scale = TWO_D_MAX_RESULTANT_STEP_METRES / resultant_step
+        commanded_delta_x *= resultant_scale
+        commanded_delta_y *= resultant_scale
+    servo.last_delta_x = commanded_delta_x
+    servo.last_delta_y = commanded_delta_y
+    servo.control_steps += 1
+    current_camera_position, current_camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    print(
+        f"2D control {servo.control_steps}: target=({u}, {v}), center="
+        f"{detection.image_center}, ex={ex}, ey={ey}, error_norm={error_norm:.3f}, "
+        f"raw_dx={raw_delta_x:.6f} m, raw_dy={raw_delta_y:.6f} m, "
+        f"dx={commanded_delta_x:.6f} m, dy={commanded_delta_y:.6f} m, "
+        f"resultant={min(resultant_step, TWO_D_MAX_RESULTANT_STEP_METRES):.6f} m, "
+        "servo state=2D TRACKING; Camera orientation="
+        f"{[round(value, 6) for value in current_camera_orientation]}."
+    )
+    return _request_camera_xy_motion(
+        servo,
+        robot_id,
+        f"2D P step {servo.control_steps}: ex={ex} px, ey={ey} px",
+        commanded_delta_x,
+        commanded_delta_y,
+        locked_joint_indices,
+        locked_initial_positions,
+        client_id,
+    )
+
+
 def _smoothstep(progress: float) -> float:
     """Ease a zero-to-one trajectory progress with zero endpoint velocity."""
     bounded_progress = max(0.0, min(1.0, progress))
@@ -2149,10 +2591,13 @@ def print_visual_servo_current_pose_takeover(
     print("  Current EE position:", [round(value, 6) for value in current_end_effector_position])
     print("  Current Camera position:", [round(value, 6) for value in current_camera_position])
     print("  Target pixel:", detection.centroid)
-    if controlled_axis not in {"ex", "ey"}:
-        raise ValueError("controlled_axis must be 'ex' or 'ey'.")
-    controlled_error = detection.pixel_error[0 if controlled_axis == "ex" else 1]
-    print(f"  {controlled_axis}:", controlled_error)
+    if controlled_axis not in {"ex", "ey", "2D"}:
+        raise ValueError("controlled_axis must be 'ex', 'ey', or '2D'.")
+    if controlled_axis == "2D":
+        print("  ex, ey:", detection.pixel_error)
+    else:
+        controlled_error = detection.pixel_error[0 if controlled_axis == "ex" else 1]
+        print(f"  {controlled_axis}:", controlled_error)
     print(
         "  First servo target: Camera position=",
         [round(value, 6) for value in first_command.target_camera_position],
@@ -2953,14 +3398,21 @@ def run_rgb_detection_hold_gui() -> None:
     The selected controller consumes one live pixel-error component and
     supplies only incremental Cartesian targets from the current camera pose.
     """
-    if VISUAL_SERVO_MODE not in {"HORIZONTAL_EX", "VERTICAL_EY"}:
+    if VISUAL_SERVO_MODE not in {"HORIZONTAL_EX", "VERTICAL_EY", "TWO_D"}:
         raise RuntimeError(
-            "VISUAL_SERVO_MODE must be 'HORIZONTAL_EX' or 'VERTICAL_EY'."
+            "VISUAL_SERVO_MODE must be 'HORIZONTAL_EX', 'VERTICAL_EY', or 'TWO_D'."
         )
+    two_dimensional_mode = VISUAL_SERVO_MODE == "TWO_D"
     vertical_mode = VISUAL_SERVO_MODE == "VERTICAL_EY"
-    stage_name = "Stage 6B" if vertical_mode else "Stage 6A"
-    controlled_axis = "ey" if vertical_mode else "ex"
-    candidate_axis_name = "Camera-Y" if vertical_mode else "Camera-X"
+    stage_name = "Stage 6C" if two_dimensional_mode else "Stage 6B" if vertical_mode else "Stage 6A"
+    controlled_axis = "2D" if two_dimensional_mode else "ey" if vertical_mode else "ex"
+    candidate_axis_name = (
+        "Camera-X + Camera-Y"
+        if two_dimensional_mode
+        else "Camera-Y"
+        if vertical_mode
+        else "Camera-X"
+    )
     client_id = p.connect(p.GUI)
     if client_id < 0:
         raise RuntimeError("Unable to open the PyBullet GUI.")
@@ -3047,7 +3499,11 @@ def run_rgb_detection_hold_gui() -> None:
         print("Waiting only for the first valid Eye-in-Hand RGB detection.")
 
         debug_text_id = update_motion_debug_text(
-            f"{stage_name}: {candidate_axis_name} calibration waiting for RGB target",
+            (
+                "Stage 6C: 2D tracking waiting for RGB target"
+                if two_dimensional_mode
+                else f"{stage_name}: {candidate_axis_name} calibration waiting for RGB target"
+            ),
             debug_text_id,
             client_id,
         )
@@ -3062,17 +3518,21 @@ def run_rgb_detection_hold_gui() -> None:
         )
         print(
             (
-                "Stage 6B uses ey only. ex remains visible for observation and is "
+                "Stage 6C uses ex + ey only with the previously calibrated "
+                "Camera-X/Y signs; no new axis sign is guessed."
+                if two_dimensional_mode
+                else "Stage 6B uses ey only. ex remains visible for observation and is "
                 "never used to create a robot command."
                 if vertical_mode
                 else "Stage 6A uses ex only. ey remains visible for observation and is "
                 "never used to create a robot command."
             )
         )
-        print(
-            f"If {stage_name} is safely HOLDing after DIVERGING/TARGET LOST, press R "
-            f"to calibrate {candidate_axis_name} again from the current active-joint pose."
-        )
+        if not two_dimensional_mode:
+            print(
+                f"If {stage_name} is safely HOLDing after DIVERGING/TARGET LOST, press R "
+                f"to calibrate {candidate_axis_name} again from the current active-joint pose."
+            )
         print("Close the PyBullet GUI window to finish the example.")
 
         # The default path never commands startup active-joint targets. From
@@ -3092,8 +3552,18 @@ def run_rgb_detection_hold_gui() -> None:
             if VISUAL_SERVO_MOTION_ENABLED
             else "HOLD: VISUAL SERVO PAUSED"
         )
-        single_axis_servo: SingleAxisVisualServo | VerticalVisualServo = (
-            VerticalVisualServo(state=initial_servo_state)
+        single_axis_servo: (
+            SingleAxisVisualServo | VerticalVisualServo | TwoDimensionalVisualServo
+        ) = (
+            TwoDimensionalVisualServo(
+                state=(
+                    "2D WAITING FOR TARGET"
+                    if VISUAL_SERVO_MOTION_ENABLED
+                    else "HOLD: VISUAL SERVO PAUSED"
+                )
+            )
+            if two_dimensional_mode
+            else VerticalVisualServo(state=initial_servo_state)
             if vertical_mode
             else SingleAxisVisualServo(state=initial_servo_state)
         )
@@ -3105,6 +3575,7 @@ def run_rgb_detection_hold_gui() -> None:
         while p.isConnected(client_id):
             if (
                 VISUAL_SERVO_MOTION_ENABLED
+                and not two_dimensional_mode
                 and single_axis_servo.is_terminal
                 and (
                     vertical_recalibration_requested(client_id)
@@ -3125,11 +3596,7 @@ def run_rgb_detection_hold_gui() -> None:
                     locked_initial_positions,
                     active_hold_targets,
                 )
-                single_axis_servo = (
-                    VerticalVisualServo()
-                    if vertical_mode
-                    else SingleAxisVisualServo()
-                )
+                single_axis_servo = VerticalVisualServo() if vertical_mode else SingleAxisVisualServo()
                 debug_text_id = update_motion_debug_text(
                     f"{stage_name}: recalibrating {candidate_axis_name} from current HOLD pose",
                     debug_text_id,
@@ -3144,8 +3611,8 @@ def run_rgb_detection_hold_gui() -> None:
             # HOLD).  Every control step below therefore holds that reached
             # pose, never the program-start active-joint angles.
             # Before the first RGB-calibration result this is a pure HOLD. Once
-            # calibrated, only the selected single-axis RGB-derived Camera
-            # command may replace these active-joint targets.
+            # calibrated, only the selected RGB-derived Camera command may
+            # replace these active-joint targets.
             apply_constrained_arm_position_control(
                 robot_id,
                 arm_joint_indices,
@@ -3169,11 +3636,21 @@ def run_rgb_detection_hold_gui() -> None:
                 simulation_step,
                 client_id,
                 camera_display,
-                single_axis_servo.state,
+                get_visual_servo_overlay_text(single_axis_servo),
             )
             if detection is not None and VISUAL_SERVO_MOTION_ENABLED:
                 previous_servo_state = single_axis_servo.state
-                if vertical_mode:
+                if two_dimensional_mode:
+                    assert isinstance(single_axis_servo, TwoDimensionalVisualServo)
+                    new_command = update_two_dimensional_visual_servo(
+                        single_axis_servo,
+                        detection,
+                        robot_id,
+                        locked_joint_indices,
+                        locked_initial_positions,
+                        client_id,
+                    )
+                elif vertical_mode:
                     assert isinstance(single_axis_servo, VerticalVisualServo)
                     new_command = update_vertical_visual_servo(
                         single_axis_servo,
@@ -3207,7 +3684,9 @@ def run_rgb_detection_hold_gui() -> None:
                 if new_command is not None:
                     if (
                         (
-                            new_command.label.startswith("Vertical P step")
+                            new_command.label.startswith("2D P step")
+                            if two_dimensional_mode
+                            else new_command.label.startswith("Vertical P step")
                             if vertical_mode
                             else new_command.label.startswith("P step")
                         )

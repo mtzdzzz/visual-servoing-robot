@@ -494,6 +494,18 @@ def detect_red_target_from_live_rgb(frame: LiveCameraFrame) -> RedTargetDetectio
         markerSize=20,
         thickness=2,
     )
+    # This is a display-only annotation. It does not participate in HSV
+    # thresholding, contour selection, or pixel-error calculation.
+    cv2.putText(
+        annotated_bgr,
+        f"Center: ({image_center[0]}, {image_center[1]})",
+        (8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
     if not valid_contours:
         cv2.putText(
