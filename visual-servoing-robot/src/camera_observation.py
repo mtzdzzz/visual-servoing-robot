@@ -379,12 +379,23 @@ def _render_rgb_with_parameters(
     No segmentation flag is requested and no ground-truth render output is
     returned to the caller.
     """
+    connection_info = p.getConnectionInfo(physicsClientId=client_id)
+    # The live Stage 5/6 path remains the same 640x480 getCameraImage RGB
+    # camera with the same view/projection matrices.  In a GUI connection we
+    # select PyBullet's hardware renderer so rendering does not become the
+    # dominant visual-servo delay. DIRECT retains Tiny Renderer as a portable
+    # fallback for headless tests.
+    renderer = (
+        p.ER_BULLET_HARDWARE_OPENGL
+        if connection_info.get("connectionMethod") == p.GUI
+        else p.ER_TINY_RENDERER
+    )
     image_width, image_height, rgba_buffer, _, _ = p.getCameraImage(
         CAMERA_IMAGE_WIDTH,
         CAMERA_IMAGE_HEIGHT,
         viewMatrix=render_parameters.view_matrix,
         projectionMatrix=render_parameters.projection_matrix,
-        renderer=p.ER_TINY_RENDERER,
+        renderer=renderer,
         physicsClientId=client_id,
     )
     return image_width, image_height, rgba_buffer
@@ -691,17 +702,15 @@ class EyeInHandRgbDisplay:
                     "PyBullet returned an unexpected live RGBA buffer length: "
                     f"expected {expected_byte_count}, got {len(rgba_bytes)}."
                 )
-            rgb_bytes = bytearray(frame.image_width * frame.image_height * 3)
-            source_index = 0
-            destination_index = 0
-            for _ in range(frame.image_width * frame.image_height):
-                rgb_bytes[destination_index] = rgba_bytes[source_index]
-                rgb_bytes[destination_index + 1] = rgba_bytes[source_index + 1]
-                rgb_bytes[destination_index + 2] = rgba_bytes[source_index + 2]
-                source_index += 4
-                destination_index += 3
+            # Keep the exact RGB pixels but avoid a 307,200-iteration Python
+            # loop on every live frame. This display-only vectorised alpha
+            # drop does not alter getCameraImage, HSV detection, or overlays.
+            rgba_image = np.frombuffer(rgba_bytes, dtype=np.uint8).reshape(
+                (frame.image_height, frame.image_width, 4)
+            )
+            rgb_bytes = rgba_image[:, :, :3].tobytes()
             ppm_header = f"P6\n{frame.image_width} {frame.image_height}\n255\n".encode("ascii")
-            image = self._tk.PhotoImage(data=ppm_header + bytes(rgb_bytes), format="PPM")
+            image = self._tk.PhotoImage(data=ppm_header + rgb_bytes, format="PPM")
             self._label.configure(image=image)
             self._label.image = image
             self._root.update_idletasks()

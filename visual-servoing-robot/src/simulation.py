@@ -53,10 +53,10 @@ MAX_JOINT_VELOCITY = 0.06  # radians/second; reaches the target in about 5 secon
 POSITION_GAIN = 0.03
 MAX_MOTOR_FORCE = 5.0
 TIME_STEP = 1.0 / 240.0
-# Stage 6A camera/servo updates are independent of the 240 Hz physics loop.
-# Keep the last verified 20 Hz baseline after the 30 Hz fine-deadband trial
-# could not complete under the existing active-joint waypoint tolerance.
-CAMERA_DISPLAY_FREQUENCY_HZ = 20.0
+# Stage 6D keeps the 240 Hz physics loop but updates RGB/detection/2D commands
+# at 30 Hz. This was verified across three safe initial poses with unchanged
+# Panda motor gains and the established 10 px 2D deadband.
+CAMERA_DISPLAY_FREQUENCY_HZ = 30.0
 CAMERA_UPDATE_INTERVAL_STEPS = max(
     1,
     round(1.0 / (TIME_STEP * CAMERA_DISPLAY_FREQUENCY_HZ)),
@@ -124,6 +124,15 @@ TWO_D_MAX_RESULTANT_STEP_METRES = min(
     SINGLE_AXIS_SERVO_MAX_STEP_METRES,
     VERTICAL_SERVO_MAX_STEP_METRES,
 )
+TWO_D_FAST_ERROR_NORM_PIXELS = 120.0
+TWO_D_MEDIUM_ERROR_NORM_PIXELS = 40.0
+TWO_D_MAX_STEP_X_FAST_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES * 3.0
+TWO_D_MAX_STEP_Y_FAST_METRES = VERTICAL_SERVO_MAX_STEP_METRES * 3.0
+TWO_D_MAX_STEP_X_MEDIUM_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES * 2.0
+TWO_D_MAX_STEP_Y_MEDIUM_METRES = VERTICAL_SERVO_MAX_STEP_METRES * 2.0
+TWO_D_MAX_STEP_X_FINE_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES
+TWO_D_MAX_STEP_Y_FINE_METRES = VERTICAL_SERVO_MAX_STEP_METRES
+TWO_D_SERVO_STAGE_NAME = "Stage 6D"
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -209,6 +218,10 @@ TRAJECTORY_MAX_WAYPOINT_SPEED = 0.18  # radians/second
 # same cadence.  Keeping this independent of the 240 Hz physics rate prevents
 # terminal spam while still exposing a control overwrite immediately.
 CONTROL_STATUS_INTERVAL_SECONDS = 0.5
+# Stage 6D runtime diagnostics use wall-clock time so the printed frequencies
+# reveal the real end-to-end update cadence, rather than only the configured
+# fixed physics timestep.
+CONTROL_CHAIN_DIAGNOSTICS_INTERVAL_SECONDS = 1.0
 MIN_TRAJECTORY_DURATION = 5.0  # seconds; Stage 3 visual-motion minimum
 POST_TRAJECTORY_SETTLE_SECONDS = 3.0
 # The default Stage 6A path does not command a startup pose.  Archived legacy
@@ -365,7 +378,7 @@ class VerticalVisualServo:
 
 @dataclass
 class TwoDimensionalVisualServo:
-    """Stage 6C state machine: simultaneous calibrated Camera-X/Y tracking."""
+    """Stage 6C/6D state machine: calibrated simultaneous Camera-X/Y tracking."""
 
     state: str = "2D WAITING FOR TARGET"
     initial_pixel: tuple[int, int] | None = None
@@ -392,8 +405,17 @@ class TwoDimensionalVisualServo:
     last_error_norm: float | None = None
     last_delta_x: float = 0.0
     last_delta_y: float = 0.0
+    last_speed_mode: str = "FINE"
     first_servo_command_logged: bool = False
     hold_requested: bool = False
+    # Runtime diagnostics. These measured values never alter a motor target,
+    # a gain, or the established waypoint completion rule.
+    pending_camera_start_position: tuple[float, float, float] | None = None
+    pending_ee_start_position: tuple[float, float, float] | None = None
+    last_requested_camera_displacement: float = 0.0
+    last_actual_camera_displacement: float = 0.0
+    last_requested_ee_displacement: float = 0.0
+    last_actual_ee_displacement: float = 0.0
 
     @property
     def is_terminal(self) -> bool:
@@ -412,6 +434,8 @@ class TwoDimensionalVisualServo:
         self.state = state
         self.pending_command = None
         self.pending_camera_orientation = None
+        self.pending_camera_start_position = None
+        self.pending_ee_start_position = None
         self.hold_requested = True
 
     def record_completed_p_step(
@@ -437,6 +461,100 @@ class TwoDimensionalVisualServo:
         del self.recent_control_history[:-5]
 
 
+@dataclass
+class ControlChainDiagnostics:
+    """Measure the real Stage 6D wall-clock control-chain cadence."""
+
+    window_started_at: float = field(default_factory=time.monotonic)
+    physics_steps: int = 0
+    camera_frames: int = 0
+    detection_frames: int = 0
+    servo_commands: int = 0
+    ik_calculations: int = 0
+    servo_period_total_seconds: float = 0.0
+    servo_period_samples: int = 0
+    requested_camera_displacement_total: float = 0.0
+    actual_camera_displacement_total: float = 0.0
+    requested_ee_displacement_total: float = 0.0
+    actual_ee_displacement_total: float = 0.0
+    last_servo_command_time: float | None = None
+
+    def record_physics_step(self) -> None:
+        self.physics_steps += 1
+
+    def record_camera_and_detection_frame(self) -> None:
+        self.camera_frames += 1
+        self.detection_frames += 1
+
+    def record_servo_command(self, servo: TwoDimensionalVisualServo) -> None:
+        now = time.monotonic()
+        self.servo_commands += 1
+        self.ik_calculations += 1
+        self.requested_camera_displacement_total += servo.last_requested_camera_displacement
+        self.actual_camera_displacement_total += servo.last_actual_camera_displacement
+        self.requested_ee_displacement_total += servo.last_requested_ee_displacement
+        self.actual_ee_displacement_total += servo.last_actual_ee_displacement
+        if self.last_servo_command_time is not None:
+            self.servo_period_total_seconds += now - self.last_servo_command_time
+            self.servo_period_samples += 1
+        self.last_servo_command_time = now
+
+    def print_if_due(self, now: float) -> None:
+        elapsed = now - self.window_started_at
+        if elapsed < CONTROL_CHAIN_DIAGNOSTICS_INTERVAL_SECONDS:
+            return
+        average_servo_period_ms = (
+            1000.0 * self.servo_period_total_seconds / self.servo_period_samples
+            if self.servo_period_samples
+            else 0.0
+        )
+        average_requested_camera = (
+            self.requested_camera_displacement_total / self.servo_commands
+            if self.servo_commands
+            else 0.0
+        )
+        average_actual_camera = (
+            self.actual_camera_displacement_total / self.servo_commands
+            if self.servo_commands
+            else 0.0
+        )
+        average_requested_ee = (
+            self.requested_ee_displacement_total / self.servo_commands
+            if self.servo_commands
+            else 0.0
+        )
+        average_actual_ee = (
+            self.actual_ee_displacement_total / self.servo_commands
+            if self.servo_commands
+            else 0.0
+        )
+        print(
+            "Control-chain measured frequency: "
+            f"Physics={self.physics_steps / elapsed:.1f} Hz; "
+            f"Camera={self.camera_frames / elapsed:.1f} Hz; "
+            f"Detection={self.detection_frames / elapsed:.1f} Hz; "
+            f"Visual Servo={self.servo_commands / elapsed:.1f} Hz; "
+            f"IK={self.ik_calculations / elapsed:.1f} Hz; "
+            f"average servo period={average_servo_period_ms:.1f} ms; "
+            f"average requested/actual Camera displacement="
+            f"{average_requested_camera:.6f}/{average_actual_camera:.6f} m; "
+            f"average requested/actual EE displacement="
+            f"{average_requested_ee:.6f}/{average_actual_ee:.6f} m."
+        )
+        self.window_started_at = now
+        self.physics_steps = 0
+        self.camera_frames = 0
+        self.detection_frames = 0
+        self.servo_commands = 0
+        self.ik_calculations = 0
+        self.servo_period_total_seconds = 0.0
+        self.servo_period_samples = 0
+        self.requested_camera_displacement_total = 0.0
+        self.actual_camera_displacement_total = 0.0
+        self.requested_ee_displacement_total = 0.0
+        self.actual_ee_displacement_total = 0.0
+
+
 def get_visual_servo_overlay_text(
     servo: SingleAxisVisualServo | VerticalVisualServo | TwoDimensionalVisualServo,
 ) -> str:
@@ -450,7 +568,7 @@ def get_visual_servo_overlay_text(
     ):
         return servo.state
     return (
-        f"{servo.state} | ex={servo.last_ex} ey={servo.last_ey} "
+        f"{servo.state} {servo.last_speed_mode} | ex={servo.last_ex} ey={servo.last_ey} "
         f"norm={servo.last_error_norm:.1f} dx={servo.last_delta_x:.4f} "
         f"dy={servo.last_delta_y:.4f}"
     )
@@ -494,6 +612,35 @@ def calculate_vertical_adaptive_p_step(ey: int | float) -> tuple[float, float, f
     )
     applied_step = max(-step_limit, min(step_limit, raw_step))
     return raw_step, step_limit, applied_step
+
+
+def get_two_d_speed_profile(error_norm: float) -> tuple[str, float, float]:
+    """Return Stage 6D's requested per-axis limits for the current 2D error.
+
+    These are individual axis limits. ``TWO_D_MAX_RESULTANT_STEP_METRES`` is
+    applied afterwards to protect the existing constrained-IK acceptance band
+    when both components are non-zero.
+    """
+    if error_norm > TWO_D_FAST_ERROR_NORM_PIXELS:
+        return "FAST", TWO_D_MAX_STEP_X_FAST_METRES, TWO_D_MAX_STEP_Y_FAST_METRES
+    if error_norm > TWO_D_MEDIUM_ERROR_NORM_PIXELS:
+        return (
+            "MEDIUM",
+            TWO_D_MAX_STEP_X_MEDIUM_METRES,
+            TWO_D_MAX_STEP_Y_MEDIUM_METRES,
+        )
+    return "FINE", TWO_D_MAX_STEP_X_FINE_METRES, TWO_D_MAX_STEP_Y_FINE_METRES
+
+
+def calculate_two_d_axis_p_step(
+    error_pixels: int | float,
+    proportional_gain: float,
+    axis_step_limit: float,
+) -> tuple[float, float]:
+    """Return raw and individually clamped Stage 6D P step for one axis."""
+    raw_step = proportional_gain * error_pixels
+    applied_step = max(-axis_step_limit, min(axis_step_limit, raw_step))
+    return raw_step, applied_step
 
 
 def get_locked_joint_report_phase(
@@ -1560,12 +1707,47 @@ def _request_camera_xy_motion(
             client_id,
         )
     except RuntimeError as error:
-        print(f"{label}: 2D control FAIL / HOLD ({error})")
-        servo.request_hold("FAIL: CAMERA IK / HOLD")
-        return None
-    _, camera_orientation = get_camera_optical_center_pose(robot_id, client_id)
+        # The nominal 2 mm command is the unchanged Stage 6C/6D maximum.
+        # Near the restricted three-active-joint workspace boundary, retain
+        # the same solver and motor baseline but request the largest safe
+        # fraction rather than declaring a false controller failure.
+        command = None
+        last_error = error
+        for scale in (0.5, 0.25):
+            try:
+                command = plan_camera_xy_motion(
+                    robot_id,
+                    f"{label} (IK-safe scale={scale:.2f})",
+                    camera_delta_x * scale,
+                    camera_delta_y * scale,
+                    locked_joint_indices,
+                    locked_initial_positions,
+                    client_id,
+                )
+                print(
+                    f"{label}: nominal constrained IK target deferred ({error}); "
+                    f"using accepted safe scale={scale:.2f}."
+                )
+                break
+            except RuntimeError as retry_error:
+                last_error = retry_error
+        if command is None:
+            print(f"{label}: 2D control FAIL / HOLD ({last_error})")
+            servo.request_hold("FAIL: CAMERA IK / HOLD")
+            return None
+    camera_position, camera_orientation = get_camera_optical_center_pose(robot_id, client_id)
+    ee_position, _ = get_camera_reference_pose(robot_id, client_id)
     servo.pending_command = command
     servo.pending_camera_orientation = tuple(camera_orientation)
+    servo.pending_camera_start_position = tuple(camera_position)
+    servo.pending_ee_start_position = tuple(ee_position)
+    requested_displacement = sqrt(
+        sum(component * component for component in command.camera_delta_w)
+    )
+    servo.last_requested_camera_displacement = requested_displacement
+    # The existing position-only wrapper uses this same world translation for
+    # the E-frame position target; it does not impose any orientation target.
+    servo.last_requested_ee_displacement = requested_displacement
     servo.pending_render_frames = 0
     return command
 
@@ -1618,6 +1800,41 @@ def get_active_joint_target_error(
     if not active_errors:
         raise RuntimeError("Stage 6A requires at least one active Panda joint.")
     return max(active_errors)
+
+
+def print_active_joint_execution_diagnostic(
+    robot_id: int,
+    joint_targets: Sequence[float] | None,
+    locked_joint_indices: Sequence[int],
+    client_id: int,
+) -> None:
+    """Print the active-joint target tracking state for one RGB servo cycle."""
+    if joint_targets is None:
+        print("  active-joint execution: no previous motor target yet.")
+        return
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    if len(joint_targets) != len(arm_joint_indices):
+        raise ValueError("A 2D servo motor target must contain seven arm joints.")
+    locked_set = set(locked_joint_indices)
+    values = []
+    for joint_index, target in zip(arm_joint_indices, joint_targets):
+        if joint_index in locked_set:
+            continue
+        joint_name = _decode_name(
+            p.getJointInfo(robot_id, joint_index, physicsClientId=client_id)[1]
+        )
+        current = p.getJointState(robot_id, joint_index, physicsClientId=client_id)[0]
+        values.append(
+            f"{joint_name}: current={current:.5f}, desired={target:.5f}, "
+            f"q_error={target - current:+.5f} rad"
+        )
+    print("  active-joint execution: " + "; ".join(values))
+    print(
+        "  active-joint motor settings: "
+        f"positionGain={POSITION_GAIN:.3f}, velocityGain={IK_VELOCITY_GAIN:.3f}, "
+        f"force={MAX_IK_MOTOR_FORCE:.1f} N m, "
+        f"maxVelocity={MAX_IK_JOINT_VELOCITY:.3f} rad/s."
+    )
 
 
 def update_single_axis_visual_servo(
@@ -2175,6 +2392,46 @@ def update_two_dimensional_visual_servo(
             locked_joint_indices,
             client_id,
         )
+        current_camera_position, current_camera_orientation = get_camera_optical_center_pose(
+            robot_id,
+            client_id,
+        )
+        current_ee_position, _ = get_camera_reference_pose(robot_id, client_id)
+        camera_start_position = (
+            servo.pending_camera_start_position or tuple(current_camera_position)
+        )
+        ee_start_position = servo.pending_ee_start_position or tuple(current_ee_position)
+        actual_camera_displacement = [
+            actual - start
+            for actual, start in zip(current_camera_position, camera_start_position)
+        ]
+        actual_ee_displacement = [
+            actual - start
+            for actual, start in zip(current_ee_position, ee_start_position)
+        ]
+        servo.last_actual_camera_displacement = sqrt(
+            sum(component * component for component in actual_camera_displacement)
+        )
+        servo.last_actual_ee_displacement = sqrt(
+            sum(component * component for component in actual_ee_displacement)
+        )
+        # This is diagnostic-only. It exposes whether a changing desired q is
+        # physically limited by the unchanged Stage 3.1 motor speed.
+        print_active_joint_execution_diagnostic(
+            robot_id,
+            servo.pending_command.joint_targets,
+            locked_joint_indices,
+            client_id,
+        )
+        print(
+            "  2D waypoint tracking: "
+            f"requested EE/Camera displacement="
+            f"{servo.last_requested_ee_displacement:.6f}/"
+            f"{servo.last_requested_camera_displacement:.6f} m; "
+            f"actual EE/Camera displacement="
+            f"{servo.last_actual_ee_displacement:.6f}/"
+            f"{servo.last_actual_camera_displacement:.6f} m."
+        )
         servo.pending_render_frames += 1
         if servo.pending_render_frames < SINGLE_AXIS_MIN_WAYPOINT_RENDER_FRAMES:
             return None
@@ -2187,24 +2444,6 @@ def update_two_dimensional_visual_servo(
                 )
                 servo.request_hold("FAIL: ACTIVE WAYPOINT TIMEOUT / HOLD")
             return None
-        current_camera_position, current_camera_orientation = get_camera_optical_center_pose(
-            robot_id,
-            client_id,
-        )
-        motion_start_position = [
-            target - delta
-            for target, delta in zip(
-                servo.pending_command.target_camera_position,
-                servo.pending_command.camera_delta_w,
-            )
-        ]
-        actual_camera_displacement = [
-            actual - start
-            for actual, start in zip(
-                current_camera_position,
-                motion_start_position,
-            )
-        ]
         orientation_step_degrees = 0.0
         if servo.pending_camera_orientation is not None:
             orientation_step_degrees = _quaternion_distance_degrees(
@@ -2218,7 +2457,7 @@ def update_two_dimensional_visual_servo(
             if orientation_step_degrees > TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES:
                 servo.orientation_stable = False
                 print(
-                    "Camera orientation warning: one Stage 6C waypoint changed "
+                    f"Camera orientation warning: one {TWO_D_SERVO_STAGE_NAME} waypoint changed "
                     f"world camera orientation by {orientation_step_degrees:.3f} deg "
                     f"(limit {TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES:.1f} deg)."
                 )
@@ -2240,6 +2479,8 @@ def update_two_dimensional_visual_servo(
         )
         servo.pending_command = None
         servo.pending_camera_orientation = None
+        servo.pending_camera_start_position = None
+        servo.pending_ee_start_position = None
         servo.pending_render_frames = 0
         servo.motion_completed = True
 
@@ -2252,7 +2493,7 @@ def update_two_dimensional_visual_servo(
         servo.control_started_at = time.monotonic()
         servo.state = "2D TRACKING"
         print(
-            "Stage 6C start from CURRENT pose: "
+            f"{TWO_D_SERVO_STAGE_NAME} start from CURRENT pose: "
             f"target=({u}, {v}), ex={ex}, ey={ey}, error_norm={error_norm:.3f}; "
             f"using verified signs X={servo.horizontal_sign:+d}, "
             f"Y={servo.vertical_sign:+d}."
@@ -2292,7 +2533,10 @@ def update_two_dimensional_visual_servo(
                 "Servo State = DIVERGING; 2D error norm increased materially on "
                 "three consecutive completed control periods. Robot = HOLD."
             )
-            print("Recent 5 Stage 6C samples (ex, ey, norm, dx, dy, camera position):")
+            print(
+                f"Recent 5 {TWO_D_SERVO_STAGE_NAME} samples "
+                "(ex, ey, norm, dx, dy, camera position):"
+            )
             for sample_ex, sample_ey, sample_norm, sample_dx, sample_dy, sample_camera in (
                 servo.recent_control_history
             ):
@@ -2311,22 +2555,32 @@ def update_two_dimensional_visual_servo(
     servo.previous_error_norm = error_norm
 
     if servo.control_steps >= SINGLE_AXIS_MAX_CONTROL_STEPS:
-        print("Stage 6C control step limit reached: HOLD.")
+        print(f"{TWO_D_SERVO_STAGE_NAME} control step limit reached: HOLD.")
         servo.last_delta_x = 0.0
         servo.last_delta_y = 0.0
         servo.request_hold("HOLD: STEP LIMIT")
         return None
 
+    speed_mode, max_step_x, max_step_y = get_two_d_speed_profile(error_norm)
+    servo.last_speed_mode = speed_mode
     if abs(ex) < TWO_D_TOL_X_PIXELS:
         raw_delta_x = 0.0
         applied_delta_x = 0.0
     else:
-        raw_delta_x, _, applied_delta_x = calculate_single_axis_adaptive_p_step(ex)
+        raw_delta_x, applied_delta_x = calculate_two_d_axis_p_step(
+            ex,
+            SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL,
+            max_step_x,
+        )
     if abs(ey) < TWO_D_TOL_Y_PIXELS:
         raw_delta_y = 0.0
         applied_delta_y = 0.0
     else:
-        raw_delta_y, _, applied_delta_y = calculate_vertical_adaptive_p_step(ey)
+        raw_delta_y, applied_delta_y = calculate_two_d_axis_p_step(
+            ey,
+            VERTICAL_SERVO_KP_METRES_PER_PIXEL,
+            max_step_y,
+        )
 
     commanded_delta_x = servo.horizontal_sign * applied_delta_x
     commanded_delta_y = servo.vertical_sign * applied_delta_y
@@ -2348,6 +2602,8 @@ def update_two_dimensional_visual_servo(
     print(
         f"2D control {servo.control_steps}: target=({u}, {v}), center="
         f"{detection.image_center}, ex={ex}, ey={ey}, error_norm={error_norm:.3f}, "
+        f"speed_mode={speed_mode}, max_x={max_step_x:.6f} m, "
+        f"max_y={max_step_y:.6f} m, "
         f"raw_dx={raw_delta_x:.6f} m, raw_dy={raw_delta_y:.6f} m, "
         f"dx={commanded_delta_x:.6f} m, dy={commanded_delta_y:.6f} m, "
         f"resultant={min(resultant_step, TWO_D_MAX_RESULTANT_STEP_METRES):.6f} m, "
@@ -3404,7 +3660,13 @@ def run_rgb_detection_hold_gui() -> None:
         )
     two_dimensional_mode = VISUAL_SERVO_MODE == "TWO_D"
     vertical_mode = VISUAL_SERVO_MODE == "VERTICAL_EY"
-    stage_name = "Stage 6C" if two_dimensional_mode else "Stage 6B" if vertical_mode else "Stage 6A"
+    stage_name = (
+        TWO_D_SERVO_STAGE_NAME
+        if two_dimensional_mode
+        else "Stage 6B"
+        if vertical_mode
+        else "Stage 6A"
+    )
     controlled_axis = "2D" if two_dimensional_mode else "ey" if vertical_mode else "ex"
     candidate_axis_name = (
         "Camera-X + Camera-Y"
@@ -3500,7 +3762,7 @@ def run_rgb_detection_hold_gui() -> None:
 
         debug_text_id = update_motion_debug_text(
             (
-                "Stage 6C: 2D tracking waiting for RGB target"
+                f"{TWO_D_SERVO_STAGE_NAME}: 2D tracking waiting for RGB target"
                 if two_dimensional_mode
                 else f"{stage_name}: {candidate_axis_name} calibration waiting for RGB target"
             ),
@@ -3518,7 +3780,7 @@ def run_rgb_detection_hold_gui() -> None:
         )
         print(
             (
-                "Stage 6C uses ex + ey only with the previously calibrated "
+                f"{TWO_D_SERVO_STAGE_NAME} uses ex + ey only with the previously calibrated "
                 "Camera-X/Y signs; no new axis sign is guessed."
                 if two_dimensional_mode
                 else "Stage 6B uses ey only. ex remains visible for observation and is "
@@ -3568,6 +3830,7 @@ def run_rgb_detection_hold_gui() -> None:
             else SingleAxisVisualServo(state=initial_servo_state)
         )
         simulation_step = 0
+        control_chain_diagnostics = ControlChainDiagnostics()
         status_interval_steps = max(
             1,
             round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP),
@@ -3621,16 +3884,18 @@ def run_rgb_detection_hold_gui() -> None:
                 client_id,
             )
             p.stepSimulation(physicsClientId=client_id)
-            update_camera_reference_axes(
-                robot_id,
-                client_id,
-                camera_axis_debug_item_ids,
-            )
-            update_camera_translation_candidate_markers(
-                robot_id,
-                client_id,
-                camera_offset_candidate_debug_item_ids,
-            )
+            control_chain_diagnostics.record_physics_step()
+            # E/C axes are GUI-only diagnostics. Match their refresh to the
+            # RGB cadence; the fixed offset-candidate markers were installed
+            # once at startup and do not need to be rebuilt while Stage 6D is
+            # tracking. Robot control and camera pose still update from the
+            # latest link state on every required control/render operation.
+            if simulation_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                update_camera_reference_axes(
+                    robot_id,
+                    client_id,
+                    camera_axis_debug_item_ids,
+                )
             detection = update_live_eye_in_hand_camera(
                 robot_id,
                 simulation_step,
@@ -3639,6 +3904,7 @@ def run_rgb_detection_hold_gui() -> None:
                 get_visual_servo_overlay_text(single_axis_servo),
             )
             if detection is not None and VISUAL_SERVO_MOTION_ENABLED:
+                control_chain_diagnostics.record_camera_and_detection_frame()
                 previous_servo_state = single_axis_servo.state
                 if two_dimensional_mode:
                     assert isinstance(single_axis_servo, TwoDimensionalVisualServo)
@@ -3682,6 +3948,9 @@ def run_rgb_detection_hold_gui() -> None:
                     )
                     single_axis_servo.motion_completed = False
                 if new_command is not None:
+                    if two_dimensional_mode:
+                        assert isinstance(single_axis_servo, TwoDimensionalVisualServo)
+                        control_chain_diagnostics.record_servo_command(single_axis_servo)
                     if (
                         (
                             new_command.label.startswith("2D P step")
@@ -3750,6 +4019,7 @@ def run_rgb_detection_hold_gui() -> None:
                     locked_initial_positions,
                     client_id,
                 )
+            control_chain_diagnostics.print_if_due(time.monotonic())
             time.sleep(TIME_STEP)
     finally:
         if camera_display is not None:
