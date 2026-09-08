@@ -53,6 +53,9 @@ MAX_JOINT_VELOCITY = 0.06  # radians/second; reaches the target in about 5 secon
 POSITION_GAIN = 0.03
 MAX_MOTOR_FORCE = 5.0
 TIME_STEP = 1.0 / 240.0
+# Stage 6A camera/servo updates are independent of the 240 Hz physics loop.
+# Keep the last verified 20 Hz baseline after the 30 Hz fine-deadband trial
+# could not complete under the existing active-joint waypoint tolerance.
 CAMERA_DISPLAY_FREQUENCY_HZ = 20.0
 CAMERA_UPDATE_INTERVAL_STEPS = max(
     1,
@@ -60,11 +63,24 @@ CAMERA_UPDATE_INTERVAL_STEPS = max(
 )
 TARGET_DETECTION_PRINT_INTERVAL_STEPS = max(1, round(1.0 / TIME_STEP))
 SINGLE_AXIS_CALIBRATION_STEP_METRES = 0.002
-# The raw P term is still hard-clamped to 2 mm below.  This value keeps the
-# command at that conservative physical limit until the target is near center.
+# Stable Stage 6A baseline.  The speed-tuning trials may temporarily raise
+# these two values, but a rejected trial must leave these safe values intact.
 SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL = 0.0001
 SINGLE_AXIS_SERVO_MAX_STEP_METRES = 0.002
+# A proportional (not fixed-distance) Camera-X step uses a progressively
+# smaller clamp near the image center.  The global MAX_STEP above remains a
+# hard upper bound, so the baseline naturally stays at 2 mm in every region.
+SINGLE_AXIS_SERVO_MAX_STEP_FAST_METRES = 0.010
+SINGLE_AXIS_SERVO_MAX_STEP_MEDIUM_METRES = 0.005
+SINGLE_AXIS_SERVO_MAX_STEP_FINE_METRES = 0.002
+SINGLE_AXIS_SERVO_FAST_ERROR_PIXELS = 100
+SINGLE_AXIS_SERVO_MEDIUM_ERROR_PIXELS = 30
+# The requested <8 px deadband was tested, but pixel quantisation stalled at
+# exactly 8 px under the fixed Stage 3.1 waypoint tolerance.  Preserve the
+# last demonstrated stable <10 px baseline rather than leaving a step-limit
+# HOLD configuration active.
 SINGLE_AXIS_SERVO_EX_GOAL_PIXELS = 10
+SINGLE_AXIS_OVERSHOOT_HOLD_PIXELS = 20
 SINGLE_AXIS_CALIBRATION_MIN_RESPONSE_PIXELS = 1
 # The locked-joint numerical IK leaves a measured residual of about 1.3 mm for
 # a 2 mm Camera-X command; accepting up to 2 mm lets RGB feedback close the
@@ -254,6 +270,35 @@ class SingleAxisVisualServo:
             (ex, command_delta_x, tuple(camera_position))
         )
         del self.recent_control_history[:-5]
+
+
+def get_single_axis_adaptive_step_limit(absolute_ex: int | float) -> float:
+    """Return the Camera-X P-step limit for the current image error.
+
+    ``SINGLE_AXIS_SERVO_MAX_STEP_METRES`` is the trial's global safety bound.
+    The zone limit only lowers that bound as the target nears the image centre;
+    it never alters the calibrated Camera-X sign or any Panda motor setting.
+    """
+    if absolute_ex > SINGLE_AXIS_SERVO_FAST_ERROR_PIXELS:
+        zone_limit = SINGLE_AXIS_SERVO_MAX_STEP_FAST_METRES
+    elif absolute_ex > SINGLE_AXIS_SERVO_MEDIUM_ERROR_PIXELS:
+        zone_limit = SINGLE_AXIS_SERVO_MAX_STEP_MEDIUM_METRES
+    else:
+        zone_limit = SINGLE_AXIS_SERVO_MAX_STEP_FINE_METRES
+    return min(SINGLE_AXIS_SERVO_MAX_STEP_METRES, zone_limit)
+
+
+def calculate_single_axis_adaptive_p_step(ex: int | float) -> tuple[float, float, float]:
+    """Return raw P step, zone limit, and bounded unsigned-sign P step.
+
+    The returned step still requires the measured calibration sign before it
+    becomes a Camera-frame command.  This helper is deliberately pure so the
+    Stage 6A speed policy can be checked without touching robot state.
+    """
+    raw_step = SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL * ex
+    step_limit = get_single_axis_adaptive_step_limit(abs(ex))
+    applied_step = max(-step_limit, min(step_limit, raw_step))
+    return raw_step, step_limit, applied_step
 
 
 def get_locked_joint_report_phase(servo: SingleAxisVisualServo) -> str:
@@ -1376,6 +1421,18 @@ def update_single_axis_visual_servo(
         )
         servo.request_hold("HORIZONTAL CENTERED")
         return None
+    if (
+        servo.initial_ex is not None
+        and ex * servo.initial_ex < 0
+        and absolute_ex > SINGLE_AXIS_OVERSHOOT_HOLD_PIXELS
+    ):
+        print(
+            "Servo State = OVERSHOOT / HOLD; target crossed the image centre "
+            f"by {absolute_ex} px (limit "
+            f"{SINGLE_AXIS_OVERSHOOT_HOLD_PIXELS} px). Robot = HOLD."
+        )
+        servo.request_hold("OVERSHOOT / HOLD")
+        return None
     if servo.previous_abs_ex is not None and absolute_ex > servo.previous_abs_ex:
         servo.consecutive_error_increases += 1
         if (
@@ -1406,17 +1463,16 @@ def update_single_axis_visual_servo(
         return None
 
     assert servo.control_direction is not None
-    raw_delta_x = SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL * ex
-    clipped_delta_x = max(
-        -SINGLE_AXIS_SERVO_MAX_STEP_METRES,
-        min(SINGLE_AXIS_SERVO_MAX_STEP_METRES, raw_delta_x),
+    raw_delta_x, step_limit, applied_delta_x = calculate_single_axis_adaptive_p_step(
+        ex
     )
-    commanded_delta_x = servo.control_direction * clipped_delta_x
+    commanded_delta_x = servo.control_direction * applied_delta_x
     servo.control_steps += 1
     print(
         f"P control {servo.control_steps}: u={u}, cx={detection.image_center[0]}, "
         f"ex={ex}, abs(ex)={absolute_ex}, "
-        f"delta command=[{commanded_delta_x:.6f}, 0.000000, 0.000000] m, "
+        f"raw_step={raw_delta_x:.6f} m, step_limit={step_limit:.6f} m, "
+        f"applied_step={commanded_delta_x:.6f} m, "
         "servo state=P CONTROL: EX ONLY"
     )
     return _request_camera_x_motion(
