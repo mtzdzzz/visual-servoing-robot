@@ -53,9 +53,9 @@ MAX_JOINT_VELOCITY = 0.06  # radians/second; reaches the target in about 5 secon
 POSITION_GAIN = 0.03
 MAX_MOTOR_FORCE = 5.0
 TIME_STEP = 1.0 / 240.0
-# Stage 6D keeps the 240 Hz physics loop but updates RGB/detection/2D commands
-# at 30 Hz. This was verified across three safe initial poses with unchanged
-# Panda motor gains and the established 10 px 2D deadband.
+# Stage 6E retains the existing 30 Hz requested RGB/detection cadence and all
+# accepted far-field speed parameters. Only its terminal FINE/PRECISION band
+# is made more accurate below.
 CAMERA_DISPLAY_FREQUENCY_HZ = 30.0
 CAMERA_UPDATE_INTERVAL_STEPS = max(
     1,
@@ -111,8 +111,30 @@ VERTICAL_SERVO_GOAL_PIXELS = SINGLE_AXIS_SERVO_EX_GOAL_PIXELS
 # repeat or guess either sign.
 STAGE6A_CALIBRATED_HORIZONTAL_SIGN = -1
 STAGE6B_CALIBRATED_VERTICAL_SIGN = -1
-TWO_D_TOL_X_PIXELS = SINGLE_AXIS_SERVO_EX_GOAL_PIXELS
-TWO_D_TOL_Y_PIXELS = VERTICAL_SERVO_GOAL_PIXELS
+# Stage 6E's final acceptance band. FAST and MEDIUM remain unchanged; only
+# the final stage must now reduce each component to two pixels or less.
+TWO_D_TOL_X_PIXELS = 2
+TWO_D_TOL_Y_PIXELS = 2
+TWO_D_PRECISION_ENTRY_ERROR_NORM_PIXELS = 10.0
+TWO_D_PRECISION_KP_SCALE = 0.4
+TWO_D_PRECISION_KP_X_METRES_PER_PIXEL = (
+    SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL * TWO_D_PRECISION_KP_SCALE
+)
+TWO_D_PRECISION_KP_Y_METRES_PER_PIXEL = (
+    VERTICAL_SERVO_KP_METRES_PER_PIXEL * TWO_D_PRECISION_KP_SCALE
+)
+TWO_D_MAX_STEP_X_PRECISION_METRES = 0.0003
+TWO_D_MAX_STEP_Y_PRECISION_METRES = 0.0003
+# The accepted constrained solver normally terminates once its positional
+# residual is below 1 mm.  That is appropriate for the Stage 3.1 / far-field
+# trajectory, but it would return the current q unchanged for a 0.3 mm Stage
+# 6E command.  PRECISION only uses the same solver with this stricter stopping
+# criterion; its locks, active-joint set, Jacobian, damping and motor targets
+# remain exactly the established baseline.
+TWO_D_PRECISION_IK_POSITION_TOLERANCE_METRES = 0.0001
+TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED = 5
+TWO_D_JITTER_SAMPLE_FRAMES = 30
+TWO_D_PRECISION_HOLD_SECONDS = 5.0
 TWO_D_ERROR_NORM_INCREASE_TOLERANCE_PIXELS = 3.0
 TWO_D_MAX_CONSECUTIVE_NORM_INCREASES = 3
 TWO_D_CAMERA_ORIENTATION_STEP_LIMIT_DEGREES = 10.0
@@ -132,7 +154,7 @@ TWO_D_MAX_STEP_X_MEDIUM_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES * 2.0
 TWO_D_MAX_STEP_Y_MEDIUM_METRES = VERTICAL_SERVO_MAX_STEP_METRES * 2.0
 TWO_D_MAX_STEP_X_FINE_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES
 TWO_D_MAX_STEP_Y_FINE_METRES = VERTICAL_SERVO_MAX_STEP_METRES
-TWO_D_SERVO_STAGE_NAME = "Stage 6D"
+TWO_D_SERVO_STAGE_NAME = "Stage 6E"
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -416,6 +438,15 @@ class TwoDimensionalVisualServo:
     last_actual_camera_displacement: float = 0.0
     last_requested_ee_displacement: float = 0.0
     last_actual_ee_displacement: float = 0.0
+    precision_settle_frames: int = 0
+    precision_settle_started_at: float | None = None
+    precision_settle_time_seconds: float | None = None
+    precision_centered_at: float | None = None
+    precision_hold_reported: bool = False
+    precision_jitter_samples: list[tuple[int, int, int, int]] = field(
+        default_factory=list
+    )
+    precision_jitter_reported: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -459,6 +490,18 @@ class TwoDimensionalVisualServo:
             )
         )
         del self.recent_control_history[:-5]
+
+    def record_precision_pixel_sample(
+        self,
+        u: int,
+        v: int,
+        ex: int,
+        ey: int,
+    ) -> None:
+        """Store hold-only RGB measurements for the Stage 6E jitter report."""
+        if self.precision_jitter_reported:
+            return
+        self.precision_jitter_samples.append((u, v, ex, ey))
 
 
 @dataclass
@@ -567,8 +610,14 @@ def get_visual_servo_overlay_text(
         or servo.last_error_norm is None
     ):
         return servo.state
+    display_state = servo.state
+    if servo.state == "2D TRACKING" and servo.precision_settle_frames:
+        display_state = (
+            "2D PRECISION SETTLING "
+            f"{servo.precision_settle_frames}/{TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED}"
+        )
     return (
-        f"{servo.state} {servo.last_speed_mode} | ex={servo.last_ex} ey={servo.last_ey} "
+        f"{display_state} {servo.last_speed_mode} | ex={servo.last_ex} ey={servo.last_ey} "
         f"norm={servo.last_error_norm:.1f} dx={servo.last_delta_x:.4f} "
         f"dy={servo.last_delta_y:.4f}"
     )
@@ -629,7 +678,13 @@ def get_two_d_speed_profile(error_norm: float) -> tuple[str, float, float]:
             TWO_D_MAX_STEP_X_MEDIUM_METRES,
             TWO_D_MAX_STEP_Y_MEDIUM_METRES,
         )
-    return "FINE", TWO_D_MAX_STEP_X_FINE_METRES, TWO_D_MAX_STEP_Y_FINE_METRES
+    if error_norm > TWO_D_PRECISION_ENTRY_ERROR_NORM_PIXELS:
+        return "FINE", TWO_D_MAX_STEP_X_FINE_METRES, TWO_D_MAX_STEP_Y_FINE_METRES
+    return (
+        "PRECISION",
+        TWO_D_MAX_STEP_X_PRECISION_METRES,
+        TWO_D_MAX_STEP_Y_PRECISION_METRES,
+    )
 
 
 def calculate_two_d_axis_p_step(
@@ -641,6 +696,39 @@ def calculate_two_d_axis_p_step(
     raw_step = proportional_gain * error_pixels
     applied_step = max(-axis_step_limit, min(axis_step_limit, raw_step))
     return raw_step, applied_step
+
+
+def print_precision_detection_jitter(
+    servo: TwoDimensionalVisualServo,
+) -> None:
+    """Print 30-frame RGB-centroid variation without changing control input."""
+    samples = servo.precision_jitter_samples
+    if (
+        servo.precision_jitter_reported
+        or len(samples) < TWO_D_JITTER_SAMPLE_FRAMES
+    ):
+        return
+
+    def statistics(component_index: int) -> tuple[int, int, float, float]:
+        values = [sample[component_index] for sample in samples]
+        mean = sum(values) / len(values)
+        standard_deviation = sqrt(
+            sum((value - mean) ** 2 for value in values) / len(values)
+        )
+        return min(values), max(values), mean, standard_deviation
+
+    u_min, u_max, u_mean, u_std = statistics(0)
+    v_min, v_max, v_mean, v_std = statistics(1)
+    ex_min, ex_max, ex_mean, ex_std = statistics(2)
+    ey_min, ey_max, ey_mean, ey_std = statistics(3)
+    print(
+        "Pixel Detection Jitter (30 hold frames): "
+        f"u[min={u_min}, max={u_max}, mean={u_mean:.2f}, std={u_std:.2f}]; "
+        f"v[min={v_min}, max={v_max}, mean={v_mean:.2f}, std={v_std:.2f}]; "
+        f"ex[min={ex_min}, max={ex_max}, mean={ex_mean:.2f}, std={ex_std:.2f}]; "
+        f"ey[min={ey_min}, max={ey_max}, mean={ey_mean:.2f}, std={ey_std:.2f}]."
+    )
+    servo.precision_jitter_reported = True
 
 
 def get_locked_joint_report_phase(
@@ -1229,6 +1317,7 @@ def calculate_constrained_position_ik(
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
     client_id: int,
+    position_tolerance: float = CONSTRAINED_IK_POSITION_TOLERANCE,
 ) -> tuple[list[int], list[float], float]:
     """Solve position IK while allowing numerical updates only on active joints.
 
@@ -1277,7 +1366,7 @@ def calculate_constrained_position_ik(
                 target - actual for target, actual in zip(target_position, actual_position)
             ]
             final_error = sqrt(sum(component * component for component in position_error))
-            if final_error <= CONSTRAINED_IK_POSITION_TOLERANCE:
+            if final_error <= position_tolerance:
                 break
 
             jacobian = [[0.0 for _ in active_joint_indices] for _ in range(3)]
@@ -1370,6 +1459,7 @@ def calculate_constrained_camera_position_ik(
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
     client_id: int,
+    position_tolerance: float = CONSTRAINED_IK_POSITION_TOLERANCE,
 ) -> tuple[list[int], list[float], float]:
     """Solve a small C-position target using the unchanged constrained E IK.
 
@@ -1410,6 +1500,7 @@ def calculate_constrained_camera_position_ik(
                 locked_joint_indices,
                 locked_initial_positions,
                 client_id,
+                position_tolerance,
             )
             _set_arm_joint_positions(
                 robot_id,
@@ -1575,6 +1666,7 @@ def plan_camera_xy_motion(
     locked_joint_indices: Sequence[int],
     locked_initial_positions: dict[int, float],
     client_id: int,
+    position_tolerance: float = CONSTRAINED_IK_POSITION_TOLERANCE,
 ) -> CameraAxisMotionCommand:
     """Plan one current-pose-relative Stage 6C Camera-frame XY increment."""
     if abs(camera_delta_x) > SINGLE_AXIS_SERVO_MAX_STEP_METRES + 1e-12:
@@ -1607,6 +1699,7 @@ def plan_camera_xy_motion(
         locked_joint_indices,
         locked_initial_positions,
         client_id,
+        position_tolerance,
     )
     if camera_target_error > SINGLE_AXIS_CAMERA_TARGET_TOLERANCE_METRES:
         raise RuntimeError(
@@ -1696,6 +1789,11 @@ def _request_camera_xy_motion(
     client_id: int,
 ) -> CameraAxisMotionCommand | None:
     """Plan one Stage 6C XY command or safely HOLD if constrained IK fails."""
+    position_tolerance = (
+        TWO_D_PRECISION_IK_POSITION_TOLERANCE_METRES
+        if servo.last_speed_mode == "PRECISION"
+        else CONSTRAINED_IK_POSITION_TOLERANCE
+    )
     try:
         command = plan_camera_xy_motion(
             robot_id,
@@ -1705,6 +1803,7 @@ def _request_camera_xy_motion(
             locked_joint_indices,
             locked_initial_positions,
             client_id,
+            position_tolerance,
         )
     except RuntimeError as error:
         # The nominal 2 mm command is the unchanged Stage 6C/6D maximum.
@@ -1723,6 +1822,7 @@ def _request_camera_xy_motion(
                     locked_joint_indices,
                     locked_initial_positions,
                     client_id,
+                    position_tolerance,
                 )
                 print(
                     f"{label}: nominal constrained IK target deferred ({error}); "
@@ -2366,7 +2466,30 @@ def update_two_dimensional_visual_servo(
     locked_initial_positions: dict[int, float],
     client_id: int,
 ) -> CameraAxisMotionCommand | None:
-    """Advance Stage 6C's current-pose-relative calibrated XY P controller."""
+    """Advance Stage 6E's current-pose-relative calibrated XY P controller."""
+    if servo.state == "2D CENTERED PRECISE":
+        # The robot is HOLDing its measured current pose. Continue consuming
+        # fresh RGB only to quantify centroid jitter; never re-use an old
+        # pixel error or send a new correction after terminal precision hold.
+        if detection.detected:
+            assert detection.centroid is not None
+            assert detection.pixel_error is not None
+            u, v = detection.centroid
+            ex, ey = detection.pixel_error
+            servo.record_precision_pixel_sample(u, v, ex, ey)
+            print_precision_detection_jitter(servo)
+        if (
+            servo.precision_centered_at is not None
+            and not servo.precision_hold_reported
+            and time.monotonic() - servo.precision_centered_at
+            >= TWO_D_PRECISION_HOLD_SECONDS
+        ):
+            print(
+                "Stage 6E precision HOLD observation: PASS; "
+                "robot held its current pose for 5.0 s without issuing a new RGB command."
+            )
+            servo.precision_hold_reported = True
+        return None
     if servo.is_terminal:
         return None
     if not detection.detected:
@@ -2490,6 +2613,13 @@ def update_two_dimensional_visual_servo(
         servo.initial_ey = ey
         servo.initial_error_norm = error_norm
         servo.previous_error_norm = None
+        servo.precision_settle_frames = 0
+        servo.precision_settle_started_at = None
+        servo.precision_settle_time_seconds = None
+        servo.precision_centered_at = None
+        servo.precision_hold_reported = False
+        servo.precision_jitter_samples.clear()
+        servo.precision_jitter_reported = False
         servo.control_started_at = time.monotonic()
         servo.state = "2D TRACKING"
         print(
@@ -2502,7 +2632,10 @@ def update_two_dimensional_visual_servo(
     if servo.state != "2D TRACKING":
         return None
 
-    if abs(ex) < TWO_D_TOL_X_PIXELS and abs(ey) < TWO_D_TOL_Y_PIXELS:
+    if abs(ex) <= TWO_D_TOL_X_PIXELS and abs(ey) <= TWO_D_TOL_Y_PIXELS:
+        if servo.precision_settle_frames == 0:
+            servo.precision_settle_started_at = time.monotonic()
+        servo.precision_settle_frames += 1
         convergence_time = (
             time.monotonic() - servo.control_started_at
             if servo.control_started_at is not None
@@ -2510,14 +2643,36 @@ def update_two_dimensional_visual_servo(
         )
         servo.last_delta_x = 0.0
         servo.last_delta_y = 0.0
+        if servo.precision_settle_frames < TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED:
+            print(
+                "2D PRECISION SETTLING: "
+                f"frame {servo.precision_settle_frames}/"
+                f"{TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED}; "
+                f"ex={ex}, ey={ey}. HOLD current pose and await NEW RGB."
+            )
+            return None
+        servo.precision_settle_time_seconds = (
+            time.monotonic() - servo.precision_settle_started_at
+            if servo.precision_settle_started_at is not None
+            else 0.0
+        )
+        servo.precision_centered_at = time.monotonic()
         print(
-            "Servo State = 2D CENTERED; "
+            "Servo State = 2D CENTERED PRECISE; "
             f"Initial (ex, ey)=({servo.initial_ex}, {servo.initial_ey}), "
             f"Final (ex, ey)=({ex}, {ey}), error_norm={error_norm:.3f}, "
-            f"Convergence time={convergence_time:.2f} s."
+            f"Convergence time={convergence_time:.2f} s, "
+            f"Precision settle time={servo.precision_settle_time_seconds:.2f} s."
         )
-        servo.request_hold("2D CENTERED")
+        servo.request_hold("2D CENTERED PRECISE")
         return None
+    if servo.precision_settle_frames:
+        print(
+            "2D PRECISION SETTLING reset: NEW RGB left the ±2 px band "
+            f"with ex={ex}, ey={ey}."
+        )
+        servo.precision_settle_frames = 0
+        servo.precision_settle_started_at = None
 
     if (
         servo.previous_error_norm is not None
@@ -2563,22 +2718,30 @@ def update_two_dimensional_visual_servo(
 
     speed_mode, max_step_x, max_step_y = get_two_d_speed_profile(error_norm)
     servo.last_speed_mode = speed_mode
-    if abs(ex) < TWO_D_TOL_X_PIXELS:
+    if abs(ex) <= TWO_D_TOL_X_PIXELS:
         raw_delta_x = 0.0
         applied_delta_x = 0.0
     else:
         raw_delta_x, applied_delta_x = calculate_two_d_axis_p_step(
             ex,
-            SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL,
+            (
+                TWO_D_PRECISION_KP_X_METRES_PER_PIXEL
+                if speed_mode == "PRECISION"
+                else SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL
+            ),
             max_step_x,
         )
-    if abs(ey) < TWO_D_TOL_Y_PIXELS:
+    if abs(ey) <= TWO_D_TOL_Y_PIXELS:
         raw_delta_y = 0.0
         applied_delta_y = 0.0
     else:
         raw_delta_y, applied_delta_y = calculate_two_d_axis_p_step(
             ey,
-            VERTICAL_SERVO_KP_METRES_PER_PIXEL,
+            (
+                TWO_D_PRECISION_KP_Y_METRES_PER_PIXEL
+                if speed_mode == "PRECISION"
+                else VERTICAL_SERVO_KP_METRES_PER_PIXEL
+            ),
             max_step_y,
         )
 
