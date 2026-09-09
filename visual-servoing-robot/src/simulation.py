@@ -9,8 +9,12 @@ PID, two-axis control, ROS, Gazebo, grasping, TCP compensation, or YOLO.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import csv
 from dataclasses import dataclass, field
+import io
 from math import acos, degrees, radians, sqrt
+from pathlib import Path
 import time
 from typing import Sequence
 
@@ -155,6 +159,22 @@ TWO_D_MAX_STEP_Y_MEDIUM_METRES = VERTICAL_SERVO_MAX_STEP_METRES * 2.0
 TWO_D_MAX_STEP_X_FINE_METRES = SINGLE_AXIS_SERVO_MAX_STEP_METRES
 TWO_D_MAX_STEP_Y_FINE_METRES = VERTICAL_SERVO_MAX_STEP_METRES
 TWO_D_SERVO_STAGE_NAME = "Stage 6E"
+
+# Stage 7 is a measurement-only robustness harness.  These five Panda active
+# joint start poses were selected from real Eye-in-Hand RGB observations with
+# the fixed red target and fixed Stage 6E configuration.  They cover the four
+# image quadrants plus a larger initial error.  The tuple order is joint5--7;
+# joint1--4 remain under the unchanged Stage 3.1 locked-joint baseline.
+STAGE7_TRIAL_ACTIVE_START_POSITIONS = (
+    ("upper_left", (-0.35, 0.50, 0.30)),   # observed (-32, -17) px
+    ("upper_right", (-0.18, 0.55, 0.20)),  # interpolated from observed (+17, -44) px
+    ("lower_left", (-0.43, 0.50, 0.00)),   # interpolated from observed (-37, +34) px
+    ("lower_right", (-0.15, 0.55, -0.20)), # interpolated from observed (+49, +5) px
+    ("large_error", (0.00, 0.80, 0.20)),   # measured about (+143, -44) px
+)
+STAGE7_MAX_SIMULATION_STEPS = 12_000
+STAGE7_MINIMUM_SUCCESSFUL_TRIALS = 4
+STAGE7_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / "outputs" / "logs"
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -4191,6 +4211,554 @@ def run_rgb_detection_hold_gui() -> None:
             p.disconnect(physicsClientId=client_id)
 
 
+def _capture_stage7_rgb_detection(
+    robot_id: int,
+    client_id: int,
+) -> RedTargetDetection:
+    """Capture one unmodified live Eye-in-Hand RGB detection for Stage 7."""
+    camera_position, camera_orientation = get_camera_optical_center_pose(
+        robot_id,
+        client_id,
+    )
+    frame = render_live_eye_in_hand_rgb_frame(
+        camera_position,
+        camera_orientation,
+        client_id,
+    )
+    return detect_red_target_from_live_rgb(frame)
+
+
+def _stage7_cycle_log_row(
+    simulation_time: float,
+    detection: RedTargetDetection,
+    servo: TwoDimensionalVisualServo,
+    robot_id: int,
+    client_id: int,
+) -> dict[str, object]:
+    """Build one CSV row from measurements only; it never changes control."""
+    ee_position, _ = get_camera_reference_pose(robot_id, client_id)
+    camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+    if detection.detected:
+        assert detection.centroid is not None
+        assert detection.pixel_error is not None
+        target_u, target_v = detection.centroid
+        ex, ey = detection.pixel_error
+        center_x, center_y = detection.image_center
+        error_norm = sqrt(ex * ex + ey * ey)
+    else:
+        target_u = target_v = center_x = center_y = ex = ey = error_norm = ""
+    return {
+        "time_s": f"{simulation_time:.6f}",
+        "target_u": target_u,
+        "target_v": target_v,
+        "center_x": center_x,
+        "center_y": center_y,
+        "ex": ex,
+        "ey": ey,
+        "error_norm": error_norm,
+        "servo_state": servo.state,
+        "delta_x_m": f"{servo.last_delta_x:.9f}",
+        "delta_y_m": f"{servo.last_delta_y:.9f}",
+        "ee_x": f"{ee_position[0]:.9f}",
+        "ee_y": f"{ee_position[1]:.9f}",
+        "ee_z": f"{ee_position[2]:.9f}",
+        "camera_x": f"{camera_position[0]:.9f}",
+        "camera_y": f"{camera_position[1]:.9f}",
+        "camera_z": f"{camera_position[2]:.9f}",
+        "target_detected": int(detection.detected),
+    }
+
+
+def _print_stage7_trial_summary(summary: dict[str, object]) -> None:
+    """Print the required concise result for one completed static trial."""
+    print(f"\nStage 7 Trial {summary['trial']}: {summary['region']}")
+    print(
+        "Initial target pixel: "
+        f"{summary['initial_target_pixel']}; ex={summary['initial_ex']}; "
+        f"ey={summary['initial_ey']}; norm={summary['initial_error_norm']}."
+    )
+    print(
+        "Final target pixel: "
+        f"{summary['final_target_pixel']}; ex={summary['final_ex']}; "
+        f"ey={summary['final_ey']}; norm={summary['final_error_norm']}."
+    )
+    print(
+        f"Convergence time: {summary['convergence_time_s']} s; "
+        f"maximum error norm: {summary['maximum_error_norm']}; "
+        f"target lost count: {summary['target_lost_count']}; "
+        f"diverging count: {summary['diverging_count']}; "
+        f"sustained oscillation: {summary['sustained_oscillation']}."
+    )
+    print(
+        f"Final state: {summary['final_state']}; "
+        f"locked joint max deviation: {summary['locked_joint_max_deviation']} rad; "
+        f"Result: {summary['result']}."
+    )
+
+
+def _run_stage7_static_trial(
+    trial_number: int,
+    region_name: str,
+    active_start_positions: Sequence[float],
+    robot_id: int,
+    arm_joint_indices: Sequence[int],
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> dict[str, object]:
+    """Run one autonomous static-target robustness trial and write its CSV.
+
+    Only active joints are positioned for the test setup.  From the first
+    physics step the normal Stage 6E controller, constrained IK and current
+    pose HOLD path are used unchanged.
+    """
+    active_joint_indices = [
+        joint_index
+        for joint_index in arm_joint_indices
+        if joint_index not in locked_joint_indices
+    ]
+    if len(active_start_positions) != len(active_joint_indices):
+        raise ValueError("A Stage 7 trial must provide one start angle per active joint.")
+
+    for joint_index, position in zip(active_joint_indices, active_start_positions):
+        p.resetJointState(
+            robot_id,
+            joint_index,
+            position,
+            targetVelocity=0.0,
+            physicsClientId=client_id,
+        )
+
+    active_trial_start = capture_active_joint_hold_targets(
+        robot_id,
+        active_joint_indices,
+        client_id,
+    )
+    active_hold_targets = dict(active_trial_start)
+    commanded_joint_targets = build_hold_joint_targets(
+        arm_joint_indices,
+        locked_initial_positions,
+        active_hold_targets,
+    )
+    servo = TwoDimensionalVisualServo()
+    trial_path = STAGE7_LOG_DIRECTORY / f"stage7_trial_{trial_number:02d}.csv"
+    cycle_fields = (
+        "time_s",
+        "target_u",
+        "target_v",
+        "center_x",
+        "center_y",
+        "ex",
+        "ey",
+        "error_norm",
+        "servo_state",
+        "delta_x_m",
+        "delta_y_m",
+        "ee_x",
+        "ee_y",
+        "ee_z",
+        "camera_x",
+        "camera_y",
+        "camera_z",
+        "target_detected",
+    )
+    target_lost_count = 0
+    diverging_count = 0
+    previous_detection_available = True
+    maximum_error_norm = 0.0
+    max_locked_deviation = 0.0
+    last_large_error_sign = {"x": 0, "y": 0}
+    large_error_sign_flips = {"x": 0, "y": 0}
+    sustained_oscillation = False
+    active_left_start_pose = False
+    returned_to_trial_start = False
+    simulation_step = 0
+    final_detection: RedTargetDetection | None = None
+
+    with trial_path.open("w", newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=cycle_fields)
+        writer.writeheader()
+        while simulation_step < STAGE7_MAX_SIMULATION_STEPS:
+            apply_constrained_arm_position_control(
+                robot_id,
+                arm_joint_indices,
+                commanded_joint_targets,
+                locked_initial_positions,
+                client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            current_locked_deviations = get_locked_joint_deviations(
+                robot_id,
+                locked_initial_positions,
+                client_id,
+            )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                max(
+                    (abs(deviation) for deviation in current_locked_deviations.values()),
+                    default=0.0,
+                ),
+            )
+            current_active_positions = capture_active_joint_hold_targets(
+                robot_id,
+                active_joint_indices,
+                client_id,
+            )
+            active_start_distance = max(
+                abs(current_active_positions[index] - active_trial_start[index])
+                for index in active_joint_indices
+            )
+            active_left_start_pose = active_left_start_pose or active_start_distance > 0.01
+            if active_left_start_pose and active_start_distance < 0.006:
+                returned_to_trial_start = True
+
+            if simulation_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                previous_state = servo.state
+                detection = _capture_stage7_rgb_detection(robot_id, client_id)
+                final_detection = detection
+                if detection.detected:
+                    assert detection.pixel_error is not None
+                    ex, ey = detection.pixel_error
+                    maximum_error_norm = max(maximum_error_norm, sqrt(ex * ex + ey * ey))
+                    for axis_name, error in (("x", ex), ("y", ey)):
+                        # Ignore the precision band: 1--2 px detector jitter
+                        # must not be reported as robot oscillation. Three
+                        # reversals outside the 10 px entry band is a visible,
+                        # sustained axis oscillation and fails the trial.
+                        if abs(error) > TWO_D_PRECISION_ENTRY_ERROR_NORM_PIXELS:
+                            current_sign = 1 if error > 0 else -1
+                            previous_sign = last_large_error_sign[axis_name]
+                            if previous_sign and current_sign != previous_sign:
+                                large_error_sign_flips[axis_name] += 1
+                            last_large_error_sign[axis_name] = current_sign
+                    sustained_oscillation = any(
+                        flips >= 3 for flips in large_error_sign_flips.values()
+                    )
+                elif previous_detection_available:
+                    target_lost_count += 1
+                previous_detection_available = detection.detected
+
+                # Stage 7 records every control cycle to CSV and prints a
+                # concise per-trial result below.  Suppressing the existing
+                # verbose Stage 6 diagnostic stream here does not alter the
+                # controller call, its command, its state or its motor target.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    update_two_dimensional_visual_servo(
+                        servo,
+                        detection,
+                        robot_id,
+                        locked_joint_indices,
+                        locked_initial_positions,
+                        client_id,
+                    )
+                if previous_state != "DIVERGING" and servo.state == "DIVERGING":
+                    diverging_count += 1
+                if servo.motion_completed:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    servo.motion_completed = False
+                if servo.pending_command is not None and not servo.hold_requested:
+                    commanded_joint_targets = list(servo.pending_command.joint_targets)
+                if servo.hold_requested:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    commanded_joint_targets = build_hold_joint_targets(
+                        arm_joint_indices,
+                        locked_initial_positions,
+                        active_hold_targets,
+                    )
+                    servo.hold_requested = False
+
+                writer.writerow(
+                    _stage7_cycle_log_row(
+                        simulation_step * TIME_STEP,
+                        detection,
+                        servo,
+                        robot_id,
+                        client_id,
+                    )
+                )
+                log_file.flush()
+
+                if (
+                    servo.state == "2D CENTERED PRECISE"
+                    and servo.precision_hold_reported
+                ):
+                    break
+                if servo.is_terminal and servo.state != "2D CENTERED PRECISE":
+                    break
+            simulation_step += 1
+            time.sleep(TIME_STEP)
+
+    if not servo.is_terminal:
+        servo.request_hold("FAIL: STAGE 7 STEP LIMIT / HOLD")
+        active_hold_targets = capture_active_joint_hold_targets(
+            robot_id,
+            active_joint_indices,
+            client_id,
+        )
+        commanded_joint_targets = build_hold_joint_targets(
+            arm_joint_indices,
+            locked_initial_positions,
+            active_hold_targets,
+        )
+        apply_constrained_arm_position_control(
+            robot_id,
+            arm_joint_indices,
+            commanded_joint_targets,
+            locked_initial_positions,
+            client_id,
+        )
+
+    final_pixel: tuple[int, int] | None = None
+    final_ex: int | None = None
+    final_ey: int | None = None
+    final_error_norm: float | None = None
+    if final_detection is not None and final_detection.detected:
+        assert final_detection.centroid is not None
+        assert final_detection.pixel_error is not None
+        final_pixel = final_detection.centroid
+        final_ex, final_ey = final_detection.pixel_error
+        final_error_norm = sqrt(final_ex * final_ex + final_ey * final_ey)
+
+    convergence_time = (
+        servo.precision_centered_at - servo.control_started_at
+        if servo.precision_centered_at is not None
+        and servo.control_started_at is not None
+        else None
+    )
+    initial_pixel = servo.initial_pixel
+    trial_pass = (
+        servo.state == "2D CENTERED PRECISE"
+        and final_ex is not None
+        and final_ey is not None
+        and abs(final_ex) <= TWO_D_TOL_X_PIXELS
+        and abs(final_ey) <= TWO_D_TOL_Y_PIXELS
+        and servo.precision_settle_frames >= TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED
+        and servo.precision_hold_reported
+        and target_lost_count == 0
+        and diverging_count == 0
+        and not sustained_oscillation
+        and not returned_to_trial_start
+        and max_locked_deviation < LOCKED_JOINT_DEVIATION_LIMIT
+    )
+    summary: dict[str, object] = {
+        "trial": trial_number,
+        "region": region_name,
+        "initial_target_pixel": initial_pixel,
+        "initial_ex": servo.initial_ex,
+        "initial_ey": servo.initial_ey,
+        "initial_error_norm": servo.initial_error_norm,
+        "final_target_pixel": final_pixel,
+        "final_ex": final_ex,
+        "final_ey": final_ey,
+        "final_error_norm": final_error_norm,
+        "convergence_time_s": convergence_time,
+        "maximum_error_norm": maximum_error_norm,
+        "target_lost_count": target_lost_count,
+        "diverging_count": diverging_count,
+        "sustained_oscillation": sustained_oscillation,
+        "final_state": servo.state,
+        "locked_joint_max_deviation": max_locked_deviation,
+        "return_to_initial": returned_to_trial_start,
+        "result": "PASS" if trial_pass else "FAIL",
+        "log_path": trial_path,
+    }
+    _print_stage7_trial_summary(summary)
+    return summary
+
+
+def run_stage7_static_robustness_validation(
+    selected_trial_numbers: Sequence[int] | None = None,
+) -> None:
+    """Run five static RGB/2D-servo trials without changing the Stage 6E baseline."""
+    STAGE7_LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    client_id = p.connect(p.GUI)
+    if client_id < 0:
+        raise RuntimeError("Unable to open the PyBullet GUI for Stage 7 validation.")
+
+    try:
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        p.setGravity(0, 0, 0, physicsClientId=client_id)
+        p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+        p.loadURDF("plane.urdf", physicsClientId=client_id)
+        robot_id = p.loadURDF(
+            "franka_panda/panda.urdf",
+            useFixedBase=True,
+            physicsClientId=client_id,
+        )
+        create_red_ground_target(client_id)
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+        locked_joint_indices = [
+            arm_joint_names[name] for name in BASELINE_LOCKED_JOINT_NAMES
+        ]
+        locked_initial_positions = {
+            joint_index: p.getJointState(
+                robot_id,
+                joint_index,
+                physicsClientId=client_id,
+            )[0]
+            for joint_index in locked_joint_indices
+        }
+        print("Stage 7 Static Robustness Test")
+        print("Frozen Stage 6E baseline: controller parameters, camera mount, "
+              "joint locks, motor gains, HSV detector and IK architecture unchanged.")
+        print("Stage 7 CSV directory:", STAGE7_LOG_DIRECTORY)
+
+        selected_trial_set = set(selected_trial_numbers or ())
+        all_trial_numbers = set(
+            range(1, len(STAGE7_TRIAL_ACTIVE_START_POSITIONS) + 1)
+        )
+        if selected_trial_set and not selected_trial_set.issubset(all_trial_numbers):
+            raise ValueError("Stage 7 trial numbers must be between 1 and 5.")
+        full_validation = not selected_trial_set or selected_trial_set == all_trial_numbers
+        summaries = []
+        for trial_number, (region_name, active_positions) in enumerate(
+            STAGE7_TRIAL_ACTIVE_START_POSITIONS,
+            start=1,
+        ):
+            if selected_trial_set and trial_number not in selected_trial_set:
+                continue
+            print(
+                f"\nStarting Trial {trial_number} ({region_name}) from active "
+                f"joint5--7={list(active_positions)}."
+            )
+            summaries.append(
+                _run_stage7_static_trial(
+                    trial_number,
+                    region_name,
+                    active_positions,
+                    robot_id,
+                    arm_joint_indices,
+                    locked_joint_indices,
+                    locked_initial_positions,
+                    client_id,
+                )
+            )
+
+        if not full_validation:
+            print(
+                "Individual Stage 7 re-test complete. The full five-trial "
+                "stage7_summary.csv was intentionally not overwritten."
+            )
+            return
+
+        summary_path = STAGE7_LOG_DIRECTORY / "stage7_summary.csv"
+        summary_fields = (
+            "trial",
+            "region",
+            "initial_ex",
+            "initial_ey",
+            "initial_error_norm",
+            "final_ex",
+            "final_ey",
+            "final_error_norm",
+            "convergence_time_s",
+            "target_lost_count",
+            "diverging_count",
+            "sustained_oscillation",
+            "locked_joint_max_deviation",
+            "return_to_initial",
+            "result",
+        )
+        with summary_path.open("w", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=summary_fields)
+            writer.writeheader()
+            for summary in summaries:
+                writer.writerow({field: summary[field] for field in summary_fields})
+
+        successful_trials = [summary for summary in summaries if summary["result"] == "PASS"]
+        converged_trials = [
+            summary
+            for summary in successful_trials
+            if summary["convergence_time_s"] is not None
+        ]
+        average_convergence_time = (
+            sum(float(summary["convergence_time_s"]) for summary in converged_trials)
+            / len(converged_trials)
+            if converged_trials
+            else None
+        )
+        mean_final_abs_ex = (
+            sum(abs(int(summary["final_ex"])) for summary in successful_trials)
+            / len(successful_trials)
+            if successful_trials
+            else None
+        )
+        mean_final_abs_ey = (
+            sum(abs(int(summary["final_ey"])) for summary in successful_trials)
+            / len(successful_trials)
+            if successful_trials
+            else None
+        )
+        mean_final_error_norm = (
+            sum(float(summary["final_error_norm"]) for summary in successful_trials)
+            / len(successful_trials)
+            if successful_trials
+            else None
+        )
+        convergence_times = [
+            float(summary["convergence_time_s"])
+            for summary in converged_trials
+        ]
+        no_return_to_initial = all(
+            not bool(summary["return_to_initial"]) for summary in summaries
+        )
+        locked_joints_ok = all(
+            float(summary["locked_joint_max_deviation"])
+            < LOCKED_JOINT_DEVIATION_LIMIT
+            for summary in summaries
+        )
+        no_sustained_oscillation = all(
+            not bool(summary["sustained_oscillation"]) for summary in summaries
+        )
+        stage_pass = len(successful_trials) >= STAGE7_MINIMUM_SUCCESSFUL_TRIALS
+
+        print("\nStage 7 Static Robustness Test")
+        for summary in summaries:
+            print(f"Trial {summary['trial']}: {summary['result']}")
+        print(f"Success Rate: {len(successful_trials)}/{len(summaries)}")
+        print(
+            "Average Convergence Time:",
+            f"{average_convergence_time:.3f} s" if average_convergence_time is not None else "N/A",
+        )
+        print(
+            "Mean Final |ex|:",
+            f"{mean_final_abs_ex:.3f} px" if mean_final_abs_ex is not None else "N/A",
+        )
+        print(
+            "Mean Final |ey|:",
+            f"{mean_final_abs_ey:.3f} px" if mean_final_abs_ey is not None else "N/A",
+        )
+        print(
+            "Mean Final Error Norm:",
+            f"{mean_final_error_norm:.3f} px" if mean_final_error_norm is not None else "N/A",
+        )
+        print(
+            "Max/Min Convergence Time:",
+            (
+                f"{max(convergence_times):.3f} / {min(convergence_times):.3f} s"
+                if convergence_times
+                else "N/A"
+            ),
+        )
+        print("No Return-to-Initial:", "PASS" if no_return_to_initial else "FAIL")
+        print("No Sustained Oscillation:", "PASS" if no_sustained_oscillation else "FAIL")
+        print("Locked Joints:", "PASS" if locked_joints_ok else "FAIL")
+        print("Summary CSV:", summary_path)
+        print("Stage 7:", "PASS" if stage_pass else "FAIL")
+    finally:
+        if p.isConnected(client_id):
+            p.disconnect(physicsClientId=client_id)
+
+
 def run_position_ik_gui_example(
     target_sequence: Sequence[tuple[str, Sequence[float]]],
 ) -> None:
@@ -4624,9 +5192,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Print Panda's joint/link structure in headless DIRECT mode.",
     )
+    parser.add_argument(
+        "--stage7",
+        action="store_true",
+        help="Run the five-trial static-target robustness validation and write CSV logs.",
+    )
+    parser.add_argument(
+        "--stage7-trial",
+        type=int,
+        choices=range(1, len(STAGE7_TRIAL_ACTIVE_START_POSITIONS) + 1),
+        metavar="N",
+        help="Run one numbered Stage 7 trial; useful for an individual GUI re-test.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage7_trial is not None:
+        run_stage7_static_robustness_validation([arguments.stage7_trial])
+    elif arguments.stage7:
+        run_stage7_static_robustness_validation()
     else:
         run_rgb_detection_hold_gui()
