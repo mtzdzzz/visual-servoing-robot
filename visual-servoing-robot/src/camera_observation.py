@@ -22,6 +22,11 @@ import pybullet as p
 GROUND_TARGET_RADIUS = 0.04  # metres
 GROUND_TARGET_WORLD_POSITION = (0.35, -0.25, GROUND_TARGET_RADIUS)
 GROUND_TARGET_RGBA = (1.0, 0.0, 0.0, 1.0)
+# Stage 8A uses a separate, light dynamic copy of the red target.  It is
+# necessary for PyBullet's point-to-point mouse constraint; the Stage 4--7
+# static target remains unchanged.
+MANUAL_TARGET_DRAG_MASS_KG = 0.02
+MANUAL_TARGET_DRAG_MAX_FORCE_NEWTONS = 50.0
 CAMERA_IMAGE_WIDTH = 640
 CAMERA_IMAGE_HEIGHT = 480
 CAMERA_FOV_Y_DEGREES = 60.0
@@ -137,6 +142,206 @@ class RedTargetDetection:
     annotated_rgba_buffer: bytes
 
 
+@dataclass
+class ManualTargetDragController:
+    """Keep PyBullet mouse manipulation separate from visual-servo control.
+
+    The controller owns only the red-target body and an optional GUI
+    point-to-point constraint.  It uses the *GUI camera* ray merely to select
+    and move that body on the ground plane.  It never returns a target world
+    position, and therefore cannot provide Cartesian information to the Panda
+    controller or to the OpenCV detector.
+    """
+
+    target_body_id: int
+    client_id: int
+    drag_plane_z: float = GROUND_TARGET_RADIUS
+    constraint_id: int | None = None
+    interaction_status: str = "READY - left-click red sphere"
+
+    # Some PyBullet wheels expose these event values as constants, while other
+    # compatible wheels document the same values without exporting symbols.
+    # Keeping this compatibility detail in the GUI-only layer avoids touching
+    # the robot/control code.
+    _mouse_move_event: int = getattr(p, "MOUSE_MOVE_EVENT", 1)
+    _mouse_button_event: int = getattr(p, "MOUSE_BUTTON_EVENT", 2)
+    _left_mouse_button: int = 0
+
+    @property
+    def dragging(self) -> bool:
+        """Whether a temporary point-to-point target constraint is active."""
+        return self.constraint_id is not None
+
+    def update(self) -> None:
+        """Consume GUI mouse events and update only the target constraint."""
+        for mouse_event in p.getMouseEvents(physicsClientId=self.client_id):
+            if len(mouse_event) < 5:
+                continue
+            event_type, mouse_x, mouse_y, button_index, button_state = mouse_event[:5]
+            if event_type == self._mouse_button_event:
+                if (
+                    button_index == self._left_mouse_button
+                    and button_state & p.KEY_WAS_TRIGGERED
+                ):
+                    self._begin_drag(mouse_x, mouse_y)
+                elif (
+                    button_index == self._left_mouse_button
+                    and button_state & p.KEY_WAS_RELEASED
+                ):
+                    self._end_drag()
+            elif event_type == self._mouse_move_event and self.dragging:
+                self._update_drag_target(mouse_x, mouse_y)
+
+    def close(self) -> None:
+        """Release a still-active constraint while preserving the ball pose."""
+        self._end_drag()
+
+    def _screen_ray(self, mouse_x: int | float, mouse_y: int | float) -> tuple[
+        list[float], list[float]
+    ] | None:
+        """Build a GUI ray using PyBullet's bundled-example convention.
+
+        ``getDebugVisualizerCamera`` exposes the rendered camera's forward,
+        horizontal and vertical vectors.  This is the same construction used
+        by PyBullet's ``createVisualShapeArray.py`` mouse-ray example, so the
+        GUI event pixels and the visualizer camera use one coordinate system.
+        """
+        camera_info = p.getDebugVisualizerCamera(physicsClientId=self.client_id)
+        if len(camera_info) < 12:
+            return None
+        image_width, image_height = int(camera_info[0]), int(camera_info[1])
+        if image_width <= 0 or image_height <= 0:
+            return None
+        camera_forward = camera_info[5]
+        horizontal = camera_info[6]
+        vertical = camera_info[7]
+        camera_distance = float(camera_info[10])
+        camera_target = camera_info[11]
+        ray_from = [
+            float(camera_target[axis] - camera_distance * camera_forward[axis])
+            for axis in range(3)
+        ]
+        forward_to_target = [
+            float(camera_target[axis] - ray_from[axis]) for axis in range(3)
+        ]
+        forward_length = sqrt(sum(component * component for component in forward_to_target))
+        if forward_length <= 1e-9:
+            return None
+        ray_forward = [
+            10000.0 * component / forward_length for component in forward_to_target
+        ]
+        horizontal_per_pixel = [component / image_width for component in horizontal]
+        vertical_per_pixel = [component / image_height for component in vertical]
+        ray_to = [
+            ray_from[axis]
+            + ray_forward[axis]
+            - 0.5 * horizontal[axis]
+            + 0.5 * vertical[axis]
+            + float(mouse_x) * horizontal_per_pixel[axis]
+            - float(mouse_y) * vertical_per_pixel[axis]
+            for axis in range(3)
+        ]
+        return ray_from, ray_to
+
+    def _ground_intersection(
+        self,
+        ray_from: Sequence[float],
+        ray_to: Sequence[float],
+    ) -> list[float] | None:
+        """Intersect a GUI ray with the sphere-centre ground plane."""
+        ray_z = ray_to[2] - ray_from[2]
+        if abs(ray_z) <= 1e-9:
+            return None
+        ray_fraction = (self.drag_plane_z - ray_from[2]) / ray_z
+        if not 0.0 <= ray_fraction <= 1.0:
+            return None
+        return [
+            ray_from[axis] + ray_fraction * (ray_to[axis] - ray_from[axis])
+            for axis in range(3)
+        ]
+
+    def _begin_drag(self, mouse_x: int | float, mouse_y: int | float) -> None:
+        if self.dragging:
+            return
+        screen_ray = self._screen_ray(mouse_x, mouse_y)
+        if screen_ray is None:
+            self.interaction_status = "RAY UNAVAILABLE"
+            return
+        ray_from, ray_to = screen_ray
+        ray_hit = p.rayTest(
+            ray_from,
+            ray_to,
+            physicsClientId=self.client_id,
+        )[0]
+        hit_body_id = int(ray_hit[0])
+        if hit_body_id != self.target_body_id:
+            self.interaction_status = "SELECTION MISS - click red sphere"
+            print("Manual target drag: selection miss; click directly on the red sphere.")
+            return
+        drag_target = self._ground_intersection(ray_from, ray_to)
+        if drag_target is None:
+            self.interaction_status = "GROUND RAY MISS"
+            return
+        # The constraint attaches at the sphere centre, rather than at the
+        # clicked surface point, so every drag update keeps the sphere resting
+        # on its z=radius ground plane.
+        self.constraint_id = p.createConstraint(
+            self.target_body_id,
+            -1,
+            -1,
+            -1,
+            p.JOINT_POINT2POINT,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            drag_target,
+            physicsClientId=self.client_id,
+        )
+        # The P2P child pivot is moved below on every mouse-motion event.
+        # This is intentionally the only world-coordinate target in Stage 8A.
+        p.changeConstraint(
+            self.constraint_id,
+            jointChildPivot=drag_target,
+            maxForce=MANUAL_TARGET_DRAG_MAX_FORCE_NEWTONS,
+            physicsClientId=self.client_id,
+        )
+        self.interaction_status = "P2P ACTIVE - dragging red sphere"
+        print("Manual target drag: selected red sphere; P2P constraint ACTIVE.")
+
+    def _update_drag_target(self, mouse_x: int | float, mouse_y: int | float) -> None:
+        if self.constraint_id is None:
+            return
+        screen_ray = self._screen_ray(mouse_x, mouse_y)
+        if screen_ray is None:
+            return
+        drag_target = self._ground_intersection(*screen_ray)
+        if drag_target is None:
+            self.interaction_status = "GROUND RAY MISS"
+            return
+        p.changeConstraint(
+            self.constraint_id,
+            jointChildPivot=drag_target,
+            maxForce=MANUAL_TARGET_DRAG_MAX_FORCE_NEWTONS,
+            physicsClientId=self.client_id,
+        )
+
+    def _end_drag(self) -> None:
+        if self.constraint_id is None:
+            return
+        p.removeConstraint(self.constraint_id, physicsClientId=self.client_id)
+        self.constraint_id = None
+        self.interaction_status = "RELEASED - left-click red sphere"
+        # With zero gravity, clear only residual drag velocity so releasing the
+        # mouse leaves the target at its chosen world pose rather than letting
+        # spring-constraint momentum move it further.
+        p.resetBaseVelocity(
+            self.target_body_id,
+            linearVelocity=(0.0, 0.0, 0.0),
+            angularVelocity=(0.0, 0.0, 0.0),
+            physicsClientId=self.client_id,
+        )
+        print("Manual target drag: released red sphere; P2P constraint REMOVED.")
+
+
 def create_red_ground_target(client_id: int) -> tuple[int, list[float]]:
     """Create a static red sphere resting on the z=0 ground plane."""
     collision_shape_id = p.createCollisionShape(
@@ -187,6 +392,37 @@ def create_red_ground_target(client_id: int) -> tuple[int, list[float]]:
         physicsClientId=client_id,
     )
     return target_body_id, list(target_position)
+
+
+def create_manual_draggable_red_ground_target(client_id: int) -> int:
+    """Create Stage 8A's draggable red sphere; no robot data is involved."""
+    collision_shape_id = p.createCollisionShape(
+        p.GEOM_SPHERE,
+        radius=GROUND_TARGET_RADIUS,
+        physicsClientId=client_id,
+    )
+    visual_shape_id = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=GROUND_TARGET_RADIUS,
+        rgbaColor=GROUND_TARGET_RGBA,
+        physicsClientId=client_id,
+    )
+    target_body_id = p.createMultiBody(
+        baseMass=MANUAL_TARGET_DRAG_MASS_KG,
+        baseCollisionShapeIndex=collision_shape_id,
+        baseVisualShapeIndex=visual_shape_id,
+        basePosition=GROUND_TARGET_WORLD_POSITION,
+        physicsClientId=client_id,
+    )
+    p.changeDynamics(
+        target_body_id,
+        -1,
+        lateralFriction=1.0,
+        linearDamping=0.8,
+        angularDamping=0.8,
+        physicsClientId=client_id,
+    )
+    return target_body_id
 
 
 def _world_direction(

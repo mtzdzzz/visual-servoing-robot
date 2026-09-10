@@ -1,9 +1,10 @@
-"""Inspect Panda or run one single-axis visual-servo check in PyBullet.
+"""PyBullet Panda inspection plus validated eye-in-hand visual-servo stages.
 
-The default loop preserves the accepted Stage 3.1 locked-joint baseline and
-fixed hand-eye camera. The selected Stage 6 mode performs RGB detection and
-one bounded proportional Camera-frame axis validation; it does not implement
-PID, two-axis control, ROS, Gazebo, grasping, TCP compensation, or YOLO.
+Every executable mode preserves the accepted Stage 3.1 locked-joint baseline
+and fixed hand-eye camera.  Stage 8A adds GUI-only red-target dragging while
+the Panda remains driven solely by the existing Eye-in-Hand RGB/OpenCV 2D
+visual-servo chain.  PID, ROS, Gazebo, grasping, TCP compensation and YOLO
+remain outside this project stage.
 """
 
 from __future__ import annotations
@@ -26,11 +27,13 @@ from camera_observation import (
     STAGE4_FINAL_RGB_OUTPUT_PATH,
     STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
     EyeInHandRgbDisplay,
+    ManualTargetDragController,
     RedTargetDetection,
     add_camera_diagnostic_debug_lines,
     add_servo_state_overlay,
     capture_eye_in_hand_rgb,
     capture_forced_look_at_rgb,
+    create_manual_draggable_red_ground_target,
     create_red_ground_target,
     detect_red_target_from_live_rgb,
     print_camera_coordinate_definition,
@@ -4211,6 +4214,305 @@ def run_rgb_detection_hold_gui() -> None:
             p.disconnect(physicsClientId=client_id)
 
 
+def _stage8_manual_drag_overlay_text(
+    servo: TwoDimensionalVisualServo,
+    last_detection: RedTargetDetection | None,
+    mouse_status: str,
+) -> str:
+    """Build display-only Stage 8A status from RGB detection state."""
+    if last_detection is None:
+        target_status = "PENDING"
+        pixel_text = "ex=N/A ey=N/A norm=N/A"
+    elif last_detection.detected:
+        assert last_detection.pixel_error is not None
+        ex, ey = last_detection.pixel_error
+        target_status = "YES"
+        pixel_text = f"ex={ex} ey={ey} norm={sqrt(ex * ex + ey * ey):.1f}"
+    else:
+        target_status = "NO"
+        pixel_text = "ex=N/A ey=N/A norm=N/A"
+    return (
+        "Mode: MANUAL TARGET DRAG | "
+        f"Target Detected: {target_status} | {pixel_text} | "
+        f"Servo: {servo.state} | Mouse: {mouse_status}"
+    )
+
+
+def _stage8_manual_drag_debug_text(
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+    mouse_status: str,
+) -> str:
+    """Return PyBullet GUI text; it remains display-only."""
+    if detection.detected:
+        assert detection.pixel_error is not None
+        ex, ey = detection.pixel_error
+        error_norm = sqrt(ex * ex + ey * ey)
+        target_status = "YES"
+        pixel_text = f"ex={ex:+d}  ey={ey:+d}  norm={error_norm:.1f} px"
+    else:
+        target_status = "NO"
+        pixel_text = "ex=N/A  ey=N/A  norm=N/A"
+    return (
+        "Mode: MANUAL TARGET DRAG\n"
+        f"Mouse: {mouse_status}\n"
+        f"Target Detected: {target_status} | {pixel_text}\n"
+        f"Servo State: {servo.state}"
+    )
+
+
+def _stage8_resume_tracking_from_live_detection(
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+) -> TwoDimensionalVisualServo:
+    """Apply only Stage 8A target-loss/drag recovery state transitions.
+
+    This helper does not inspect a target body or a world position.  A newly
+    detected red contour is the sole condition for automatic recovery from
+    ``TARGET LOST / HOLD``.  Likewise, a moved contour outside the precision
+    band starts a fresh *current-pose* tracking episode after a prior centred
+    hold.
+    """
+    if not detection.detected:
+        if servo.state == "2D CENTERED PRECISE":
+            servo.request_hold("TARGET LOST / HOLD")
+        return servo
+
+    assert detection.pixel_error is not None
+    ex, ey = detection.pixel_error
+    if servo.state == "TARGET LOST / HOLD":
+        print("Stage 8A target re-detected from RGB: automatic 2D TRACKING resume.")
+        return TwoDimensionalVisualServo()
+    if (
+        servo.state == "2D CENTERED PRECISE"
+        and (abs(ex) > TWO_D_TOL_X_PIXELS or abs(ey) > TWO_D_TOL_Y_PIXELS)
+    ):
+        print(
+            "Stage 8A RGB target left the precision band: "
+            "starting a new 2D TRACKING episode from CURRENT pose."
+        )
+        return TwoDimensionalVisualServo()
+    return servo
+
+
+def run_stage8_manual_target_drag_gui() -> None:
+    """Run Stage 8A: GUI-only target dragging plus RGB-only 2D tracking.
+
+    The red target is selected by a GUI ray test and moved by a temporary
+    point-to-point constraint.  The constrained Panda controller is the
+    unmodified Stage 6E 2D visual servo: its sole input is the OpenCV result
+    from the latest Eye-in-Hand RGB image.
+    """
+    client_id = p.connect(p.GUI)
+    if client_id < 0:
+        raise RuntimeError("Unable to open the PyBullet GUI for Stage 8A.")
+
+    camera_display: EyeInHandRgbDisplay | None = None
+    manual_drag: ManualTargetDragController | None = None
+    try:
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        p.setGravity(0, 0, 0, physicsClientId=client_id)
+        p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+        enable_pybullet_camera_debug_previews(client_id)
+        # Stage 8A owns left-button manipulation through its explicit
+        # rayTest/P2P handler. Disable the GUI's implicit mouse picker so it
+        # cannot create a competing constraint on the same target.
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_MOUSE_PICKING,
+            0,
+            physicsClientId=client_id,
+        )
+        p.loadURDF("plane.urdf", physicsClientId=client_id)
+        robot_id = p.loadURDF(
+            "franka_panda/panda.urdf",
+            useFixedBase=True,
+            physicsClientId=client_id,
+        )
+        end_effector_name = _decode_name(
+            p.getJointInfo(
+                robot_id,
+                END_EFFECTOR_LINK_INDEX,
+                physicsClientId=client_id,
+            )[12]
+        )
+        if end_effector_name != END_EFFECTOR_LINK_NAME:
+            raise RuntimeError(
+                f"Expected E frame {END_EFFECTOR_LINK_NAME!r}; got {end_effector_name!r}."
+            )
+
+        initial_arm_positions = print_panda_arm_joint_configuration(robot_id, client_id)
+        arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+        arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+        locked_joint_indices = [
+            arm_joint_names[name] for name in BASELINE_LOCKED_JOINT_NAMES
+        ]
+        locked_initial_positions = {
+            index: initial_arm_positions[index] for index in locked_joint_indices
+        }
+        active_joint_indices = [
+            index for index in arm_joint_indices if index not in locked_joint_indices
+        ]
+
+        # Only the GUI interaction object receives this body id. No target
+        # world position/body information enters the RGB detector, IK, or
+        # motor-target construction below.
+        target_body_id = create_manual_draggable_red_ground_target(client_id)
+        manual_drag = ManualTargetDragController(target_body_id, client_id)
+        camera_display = EyeInHandRgbDisplay("Eye-in-Hand RGB - Stage 8A")
+        camera_axis_debug_item_ids: list[int] = []
+        update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+
+        print("Stage 8A: Manual Mouse Drag Target Tracking")
+        print("Mode: MANUAL TARGET DRAG")
+        print("Mouse interaction: left-click the red sphere, drag on the ground plane, release.")
+        print("Camera: ACTIVE continuously; RGB -> OpenCV -> (u, v) -> ex/ey -> IK -> Panda.")
+        print("Vision-only tracking: target world coordinates are unavailable to the servo.")
+        print("Close the PyBullet GUI window to stop Stage 8A.")
+
+        active_hold_targets = capture_active_joint_hold_targets(
+            robot_id,
+            active_joint_indices,
+            client_id,
+        )
+        commanded_joint_targets = build_hold_joint_targets(
+            arm_joint_indices,
+            locked_initial_positions,
+            active_hold_targets,
+        )
+        servo = TwoDimensionalVisualServo()
+        last_detection: RedTargetDetection | None = None
+        simulation_step = 0
+        debug_text_id = update_motion_debug_text(
+            _stage8_manual_drag_overlay_text(
+                servo,
+                last_detection,
+                manual_drag.interaction_status,
+            ),
+            None,
+            client_id,
+        )
+        control_chain_diagnostics = ControlChainDiagnostics()
+        status_interval_steps = max(1, round(CONTROL_STATUS_INTERVAL_SECONDS / TIME_STEP))
+
+        while p.isConnected(client_id):
+            # This object only updates the draggable target constraint.  It
+            # intentionally has no reference to Panda, joint targets, IK or
+            # the RGB-detection result.
+            manual_drag.update()
+            apply_constrained_arm_position_control(
+                robot_id,
+                arm_joint_indices,
+                commanded_joint_targets,
+                locked_initial_positions,
+                client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            control_chain_diagnostics.record_physics_step()
+
+            if simulation_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                update_camera_reference_axes(
+                    robot_id,
+                    client_id,
+                    camera_axis_debug_item_ids,
+                )
+            detection = update_live_eye_in_hand_camera(
+                robot_id,
+                simulation_step,
+                client_id,
+                camera_display,
+                _stage8_manual_drag_overlay_text(
+                    servo,
+                    last_detection,
+                    manual_drag.interaction_status,
+                ),
+            )
+            if detection is not None:
+                last_detection = detection
+                control_chain_diagnostics.record_camera_and_detection_frame()
+                previous_servo_state = servo.state
+                servo = _stage8_resume_tracking_from_live_detection(servo, detection)
+                new_command = update_two_dimensional_visual_servo(
+                    servo,
+                    detection,
+                    robot_id,
+                    locked_joint_indices,
+                    locked_initial_positions,
+                    client_id,
+                )
+
+                if servo.motion_completed:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    servo.motion_completed = False
+                if new_command is not None:
+                    control_chain_diagnostics.record_servo_command(servo)
+                    if (
+                        new_command.label.startswith("2D P step")
+                        and not servo.first_servo_command_logged
+                    ):
+                        current_pose_source_ok = print_visual_servo_current_pose_takeover(
+                            robot_id,
+                            arm_joint_indices,
+                            initial_arm_positions,
+                            detection,
+                            new_command,
+                            client_id,
+                            controlled_axis="2D",
+                        )
+                        servo.first_servo_command_logged = True
+                        if not current_pose_source_ok:
+                            servo.request_hold(
+                                "FAIL: FIRST TARGET NOT CURRENT POSE / HOLD"
+                            )
+                    if not servo.hold_requested:
+                        commanded_joint_targets = list(new_command.joint_targets)
+                if servo.hold_requested:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    commanded_joint_targets = build_hold_joint_targets(
+                        arm_joint_indices,
+                        locked_initial_positions,
+                        active_hold_targets,
+                    )
+                    servo.hold_requested = False
+
+                if servo.state != previous_servo_state:
+                    print(f"Stage 8A Servo State: {servo.state}")
+                debug_text_id = update_motion_debug_text(
+                    _stage8_manual_drag_debug_text(
+                        servo,
+                        detection,
+                        manual_drag.interaction_status,
+                    ),
+                    debug_text_id,
+                    client_id,
+                )
+
+            simulation_step += 1
+            if simulation_step % status_interval_steps == 0:
+                print_locked_joint_status(
+                    get_locked_joint_report_phase(servo),
+                    robot_id,
+                    locked_initial_positions,
+                    client_id,
+                )
+            control_chain_diagnostics.print_if_due(time.monotonic())
+            time.sleep(TIME_STEP)
+    finally:
+        if manual_drag is not None:
+            manual_drag.close()
+        if camera_display is not None:
+            camera_display.close()
+        if p.isConnected(client_id):
+            p.disconnect(physicsClientId=client_id)
+
+
 def _capture_stage7_rgb_detection(
     robot_id: int,
     client_id: int,
@@ -5204,10 +5506,17 @@ if __name__ == "__main__":
         metavar="N",
         help="Run one numbered Stage 7 trial; useful for an individual GUI re-test.",
     )
+    parser.add_argument(
+        "--stage8-manual",
+        action="store_true",
+        help="Run Stage 8A: drag the red target in the PyBullet GUI while RGB-only 2D tracking stays active.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage8_manual:
+        run_stage8_manual_target_drag_gui()
     elif arguments.stage7_trial is not None:
         run_stage7_static_robustness_validation([arguments.stage7_trial])
     elif arguments.stage7:
