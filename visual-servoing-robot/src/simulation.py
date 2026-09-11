@@ -14,7 +14,7 @@ import contextlib
 import csv
 from dataclasses import dataclass, field
 import io
-from math import acos, degrees, radians, sqrt
+from math import acos, cos, degrees, pi, radians, sin, sqrt
 from pathlib import Path
 import time
 from typing import Sequence
@@ -27,6 +27,8 @@ from camera_observation import (
     STAGE4_FINAL_RGB_OUTPUT_PATH,
     STAGE4_SECOND_POSE_RGB_OUTPUT_PATH,
     EyeInHandRgbDisplay,
+    GROUND_TARGET_RADIUS,
+    GROUND_TARGET_WORLD_POSITION,
     ManualTargetDragController,
     RedTargetDetection,
     add_camera_diagnostic_debug_lines,
@@ -178,6 +180,24 @@ STAGE7_TRIAL_ACTIVE_START_POSITIONS = (
 STAGE7_MAX_SIMULATION_STEPS = 12_000
 STAGE7_MINIMUM_SUCCESSFUL_TRIALS = 4
 STAGE7_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / "outputs" / "logs"
+
+# Stage 9 is measurement-only: the accepted Stage 6E controller and all
+# camera/robot parameters remain frozen.  Each trial starts from the same
+# Panda pose and target centre, follows the same one-axis sine path, and
+# varies only its frequency (and therefore its peak target speed).
+STAGE9_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / "outputs" / "logs"
+STAGE9_TARGET_CENTER_WORLD = tuple(GROUND_TARGET_WORLD_POSITION)
+STAGE9_TARGET_SINE_AMPLITUDE_METRES = 0.05
+STAGE9_DURATION_SECONDS = 20.0
+# This is an experiment-protocol safety bound, not a controller parameter.
+# The actual warm-up completion condition remains the existing five fresh RGB
+# frames inside the accepted ±2 pixel precision band.
+STAGE9_WARMUP_MAX_SIMULATION_SECONDS = 90.0
+STAGE9_TRIAL_SPECS = (
+    ("SLOW", 0.05),
+    ("MEDIUM", 0.10),
+    ("FAST", 0.20),
+)
 
 # Verified from the loaded franka_panda/panda.urdf: index 7 is panda_link8.
 # E is the Panda's fixed wrist/flange link, before panda_hand.  It is the
@@ -4513,6 +4533,1129 @@ def run_stage8_manual_target_drag_gui() -> None:
             p.disconnect(physicsClientId=client_id)
 
 
+def _stage9_target_world_position(simulation_time_s: float, frequency_hz: float) -> list[float]:
+    """Return Stage 9's repeatable ground-truth sine trajectory.
+
+    This function is deliberately isolated from all vision/servo functions.
+    Its result is applied only to the PyBullet target body and optionally
+    written to CSV as experiment ground truth.
+    """
+    x0, y0, z0 = STAGE9_TARGET_CENTER_WORLD
+    return [
+        x0 + STAGE9_TARGET_SINE_AMPLITUDE_METRES * sin(2.0 * pi * frequency_hz * simulation_time_s),
+        y0,
+        z0,
+    ]
+
+
+def _stage9_target_world_velocity(simulation_time_s: float, frequency_hz: float) -> list[float]:
+    """Return the trajectory derivative for PyBullet's dynamic target body."""
+    return [
+        STAGE9_TARGET_SINE_AMPLITUDE_METRES
+        * 2.0
+        * pi
+        * frequency_hz
+        * cos(2.0 * pi * frequency_hz * simulation_time_s),
+        0.0,
+        0.0,
+    ]
+
+
+def _stage9_overlay_text(
+    speed_level: str,
+    simulation_time_s: float,
+    servo: TwoDimensionalVisualServo,
+    last_detection: RedTargetDetection | None,
+) -> str:
+    """Create display-only Stage 9 RGB overlay text from live RGB data."""
+    if last_detection is not None and last_detection.detected:
+        assert last_detection.pixel_error is not None
+        ex, ey = last_detection.pixel_error
+        detection_text = "YES"
+        error_text = f"ex={ex} ey={ey} norm={sqrt(ex * ex + ey * ey):.1f}"
+    else:
+        detection_text = "NO" if last_detection is not None else "PENDING"
+        error_text = "ex=N/A ey=N/A norm=N/A"
+    return (
+        f"STAGE 9 {speed_level} | t={simulation_time_s:.1f}/{STAGE9_DURATION_SECONDS:.1f}s | "
+        f"Detection: {detection_text} | {error_text} | Servo: {servo.state}"
+    )
+
+
+def _stage9_gui_debug_text(
+    speed_level: str,
+    simulation_time_s: float,
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+) -> str:
+    """Create PyBullet GUI status text without using target world coordinates."""
+    if detection.detected:
+        assert detection.centroid is not None
+        assert detection.pixel_error is not None
+        ex, ey = detection.pixel_error
+        error_norm = sqrt(ex * ex + ey * ey)
+        target_text = f"Target: {detection.centroid} | Detection: YES"
+        error_text = f"ex={ex:+d}  ey={ey:+d}  Error={error_norm:.1f} px"
+    else:
+        target_text = "Target: N/A | Detection: NO"
+        error_text = "ex=N/A  ey=N/A  Error=N/A"
+    return (
+        "STAGE 9 - DYNAMIC TRACKING TEST\n"
+        f"Trial: {speed_level} | Time: {simulation_time_s:.1f} / {STAGE9_DURATION_SECONDS:.1f} s\n"
+        f"{target_text}\n{error_text}\nServo: {servo.state}"
+    )
+
+
+def _stage9_resume_dynamic_tracking_from_live_detection(
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+) -> TwoDimensionalVisualServo:
+    """Keep dynamic tracking live using only fresh OpenCV detections.
+
+    Stage 6E correctly holds after a static target is precisely centred.  In
+    Stage 9, each new RGB frame is still evaluated: when the moving target
+    leaves the deadband, a fresh 2D state machine is created from the current
+    Panda pose.  No target world position or body id enters this decision.
+    """
+    if not detection.detected:
+        if servo.state == "2D CENTERED PRECISE":
+            servo.request_hold("TARGET LOST / HOLD")
+        return servo
+
+    assert detection.pixel_error is not None
+    ex, ey = detection.pixel_error
+    if servo.state == "TARGET LOST / HOLD":
+        print("Stage 9 RGB target re-detected: resume TRACKING from CURRENT pose.")
+        return TwoDimensionalVisualServo()
+    if (
+        servo.state == "2D CENTERED PRECISE"
+        and (abs(ex) > TWO_D_TOL_X_PIXELS or abs(ey) > TWO_D_TOL_Y_PIXELS)
+    ):
+        print("Stage 9 target left the deadband: resume TRACKING from CURRENT pose.")
+        return TwoDimensionalVisualServo()
+    return servo
+
+
+def _stage9_start_dynamic_tracking_from_current_pose(
+    servo: TwoDimensionalVisualServo,
+    detection: RedTargetDetection,
+    robot_id: int,
+    locked_joint_indices: Sequence[int],
+    locked_initial_positions: dict[int, float],
+    client_id: int,
+) -> CameraAxisMotionCommand | None:
+    """Issue a latest-observation Stage 9 command without waypoint gating.
+
+    This is intentionally separate from ``update_two_dimensional_visual_servo``:
+    that accepted static-target controller waits for an old waypoint to finish.
+    During a dynamic evaluation, every fresh RGB observation must instead plan
+    from the *measured current* camera/EE pose and replace the previous motor
+    target.  The P gains, speed profiles, signs, deadband and constrained IK
+    are the existing Stage 6E implementations.
+    """
+    if not detection.detected:
+        servo.last_delta_x = 0.0
+        servo.last_delta_y = 0.0
+        servo.request_hold("TARGET LOST / HOLD")
+        return None
+
+    assert detection.centroid is not None
+    assert detection.pixel_error is not None
+    u, v = detection.centroid
+    ex, ey = detection.pixel_error
+    error_norm = sqrt(ex * ex + ey * ey)
+    servo.last_ex = ex
+    servo.last_ey = ey
+    servo.last_error_norm = error_norm
+
+    if servo.state == "2D WAITING FOR TARGET":
+        servo.initial_pixel = (u, v)
+        servo.initial_ex = ex
+        servo.initial_ey = ey
+        servo.initial_error_norm = error_norm
+        servo.control_started_at = time.monotonic()
+    servo.state = "2D DYNAMIC TRACKING"
+
+    # A newly centred target cancels an unfinished old correction and holds
+    # the measured current pose. The next RGB frame can immediately resume.
+    if abs(ex) <= TWO_D_TOL_X_PIXELS and abs(ey) <= TWO_D_TOL_Y_PIXELS:
+        servo.last_delta_x = 0.0
+        servo.last_delta_y = 0.0
+        servo.pending_command = None
+        servo.pending_camera_orientation = None
+        servo.pending_camera_start_position = None
+        servo.pending_ee_start_position = None
+        servo.hold_requested = True
+        return None
+
+    speed_mode, max_step_x, max_step_y = get_two_d_speed_profile(error_norm)
+    servo.last_speed_mode = speed_mode
+    if abs(ex) <= TWO_D_TOL_X_PIXELS:
+        raw_delta_x = applied_delta_x = 0.0
+    else:
+        raw_delta_x, applied_delta_x = calculate_two_d_axis_p_step(
+            ex,
+            (
+                TWO_D_PRECISION_KP_X_METRES_PER_PIXEL
+                if speed_mode == "PRECISION"
+                else SINGLE_AXIS_SERVO_KP_METRES_PER_PIXEL
+            ),
+            max_step_x,
+        )
+    if abs(ey) <= TWO_D_TOL_Y_PIXELS:
+        raw_delta_y = applied_delta_y = 0.0
+    else:
+        raw_delta_y, applied_delta_y = calculate_two_d_axis_p_step(
+            ey,
+            (
+                TWO_D_PRECISION_KP_Y_METRES_PER_PIXEL
+                if speed_mode == "PRECISION"
+                else VERTICAL_SERVO_KP_METRES_PER_PIXEL
+            ),
+            max_step_y,
+        )
+
+    commanded_delta_x = servo.horizontal_sign * applied_delta_x
+    commanded_delta_y = servo.vertical_sign * applied_delta_y
+    resultant_step = sqrt(commanded_delta_x ** 2 + commanded_delta_y ** 2)
+    if resultant_step > TWO_D_MAX_RESULTANT_STEP_METRES:
+        scale = TWO_D_MAX_RESULTANT_STEP_METRES / resultant_step
+        commanded_delta_x *= scale
+        commanded_delta_y *= scale
+    servo.last_delta_x = commanded_delta_x
+    servo.last_delta_y = commanded_delta_y
+    servo.control_steps += 1
+    command = _request_camera_xy_motion(
+        servo,
+        robot_id,
+        f"Stage 9 latest 2D command {servo.control_steps}: ex={ex}, ey={ey}, "
+        f"raw=({raw_delta_x:.6f}, {raw_delta_y:.6f}) m",
+        commanded_delta_x,
+        commanded_delta_y,
+        locked_joint_indices,
+        locked_initial_positions,
+        client_id,
+    )
+    # ``_request_camera_xy_motion`` plans from get_camera_optical_center_pose
+    # on this exact RGB cycle and overwrites ``pending_command``.  No old
+    # target is checked for completion before this call.
+    return command
+
+
+def _stage9_cycle_log_row(
+    simulation_time_s: float,
+    speed_level: str,
+    frequency_hz: float,
+    target_world_position: Sequence[float],
+    detection: RedTargetDetection,
+    servo: TwoDimensionalVisualServo,
+    ik_command_issued: bool,
+    nonzero_correction_issued: bool,
+    robot_id: int,
+    client_id: int,
+) -> dict[str, object]:
+    """Return one Stage 9 CSV row; target world data is logging-only."""
+    ee_position, _ = get_camera_reference_pose(robot_id, client_id)
+    camera_position, _ = get_camera_optical_center_pose(robot_id, client_id)
+    if detection.detected:
+        assert detection.centroid is not None
+        assert detection.pixel_error is not None
+        target_u, target_v = detection.centroid
+        center_x, center_y = detection.image_center
+        ex, ey = detection.pixel_error
+        error_norm: float | str = sqrt(ex * ex + ey * ey)
+    else:
+        target_u = target_v = center_x = center_y = ex = ey = error_norm = ""
+    return {
+        "time_s": f"{simulation_time_s:.6f}",
+        "trial": speed_level,
+        "target_speed_level": speed_level,
+        "target_frequency_hz": f"{frequency_hz:.6f}",
+        "target_u": target_u,
+        "target_v": target_v,
+        "center_x": center_x,
+        "center_y": center_y,
+        "ex": ex,
+        "ey": ey,
+        "error_norm": error_norm,
+        "target_detected": int(detection.detected),
+        "servo_state": servo.state,
+        "servo_decision": 1,
+        "ik_command_issued": int(ik_command_issued),
+        "nonzero_correction_issued": int(nonzero_correction_issued),
+        "delta_x_m": f"{servo.last_delta_x:.9f}",
+        "delta_y_m": f"{servo.last_delta_y:.9f}",
+        "ee_x": f"{ee_position[0]:.9f}",
+        "ee_y": f"{ee_position[1]:.9f}",
+        "ee_z": f"{ee_position[2]:.9f}",
+        "camera_x": f"{camera_position[0]:.9f}",
+        "camera_y": f"{camera_position[1]:.9f}",
+        "camera_z": f"{camera_position[2]:.9f}",
+        # Ground truth is explicit log-only experiment metadata. The visual
+        # servo receives only ``detection`` above.
+        "target_world_x_log_only": f"{target_world_position[0]:.9f}",
+        "target_world_y_log_only": f"{target_world_position[1]:.9f}",
+        "target_world_z_log_only": f"{target_world_position[2]:.9f}",
+    }
+
+
+def _stage9_metric(value: float | None, unit: str = "px") -> str:
+    """Format an optional Stage 9 metric for concise terminal output."""
+    return f"{value:.2f} {unit}" if value is not None else "N/A"
+
+
+def _print_stage9_trial_summary(summary: dict[str, object]) -> None:
+    """Print the required frozen-controller Stage 9 per-trial report."""
+    print("\n===== Stage 9 Trial Summary =====")
+    print("Speed Level:", summary["speed_level"])
+    print("Motion:", summary["target_motion_parameter"])
+    if "warmup_duration_s" in summary:
+        print("Warm-up duration:", _stage9_metric(summary["warmup_duration_s"], "s"))
+        print(
+            "READY ex/ey:",
+            f"{summary.get('ready_ex', 'N/A')} / {summary.get('ready_ey', 'N/A')}",
+        )
+    print(f"Duration: {float(summary['duration_s']):.2f} s")
+    print("Frames:", summary["frames"])
+    if "rgb_fps" in summary:
+        print("RGB FPS:", _stage9_metric(summary["rgb_fps"], "Hz"))
+        print("Detection FPS:", _stage9_metric(summary["detection_fps"], "Hz"))
+        print("Servo Decision FPS:", _stage9_metric(summary["servo_decision_fps"], "Hz"))
+        print("IK Command FPS:", _stage9_metric(summary["ik_command_fps"], "Hz"))
+        print("Non-zero Correction FPS:", _stage9_metric(summary["nonzero_correction_fps"], "Hz"))
+    else:
+        print("Tracking FPS:", _stage9_metric(summary["tracking_fps"], "Hz"))
+    print("Mean |ex|:", _stage9_metric(summary["mean_abs_ex"]))
+    print("Mean |ey|:", _stage9_metric(summary["mean_abs_ey"]))
+    print("Mean Error Norm:", _stage9_metric(summary["mean_error_norm"]))
+    print("RMSE:", _stage9_metric(summary["rmse"]))
+    print("Max Error:", _stage9_metric(summary["max_error_norm"]))
+    print("Target Lost Count:", summary["target_lost_count"])
+    print("Detection Rate:", _stage9_metric(summary["detection_rate_percent"], "%"))
+    print("Result:", summary["result"])
+    print("=================================")
+
+
+def _run_stage9_dynamic_trial(
+    speed_level: str,
+    frequency_hz: float,
+    client_id: int,
+    camera_display: EyeInHandRgbDisplay,
+) -> dict[str, object]:
+    """Run one fixed-duration dynamic-target experiment with frozen control."""
+    p.resetSimulation(physicsClientId=client_id)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+    p.setGravity(0, 0, 0, physicsClientId=client_id)
+    p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+    enable_pybullet_camera_debug_previews(client_id)
+    p.loadURDF("plane.urdf", physicsClientId=client_id)
+    robot_id = p.loadURDF(
+        "franka_panda/panda.urdf",
+        useFixedBase=True,
+        physicsClientId=client_id,
+    )
+    end_effector_name = _decode_name(
+        p.getJointInfo(robot_id, END_EFFECTOR_LINK_INDEX, physicsClientId=client_id)[12]
+    )
+    if end_effector_name != END_EFFECTOR_LINK_NAME:
+        raise RuntimeError(
+            f"Expected E frame {END_EFFECTOR_LINK_NAME!r}; got {end_effector_name!r}."
+        )
+    initial_arm_positions = print_panda_arm_joint_configuration(robot_id, client_id)
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+    locked_joint_indices = [arm_joint_names[name] for name in BASELINE_LOCKED_JOINT_NAMES]
+    locked_initial_positions = {
+        index: initial_arm_positions[index] for index in locked_joint_indices
+    }
+    active_joint_indices = [
+        index for index in arm_joint_indices if index not in locked_joint_indices
+    ]
+
+    # This body id and its world pose remain inside the experiment-motion and
+    # CSV layers. They are never passed to OpenCV, the 2D controller, IK, or
+    # motor-command code.
+    target_body_id = create_manual_draggable_red_ground_target(client_id)
+    p.resetBasePositionAndOrientation(
+        target_body_id,
+        STAGE9_TARGET_CENTER_WORLD,
+        (0.0, 0.0, 0.0, 1.0),
+        physicsClientId=client_id,
+    )
+    p.resetBaseVelocity(
+        target_body_id,
+        linearVelocity=(0.0, 0.0, 0.0),
+        angularVelocity=(0.0, 0.0, 0.0),
+        physicsClientId=client_id,
+    )
+    camera_axis_debug_item_ids: list[int] = []
+    update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+
+    active_hold_targets = capture_active_joint_hold_targets(
+        robot_id,
+        active_joint_indices,
+        client_id,
+    )
+    commanded_joint_targets = build_hold_joint_targets(
+        arm_joint_indices,
+        locked_initial_positions,
+        active_hold_targets,
+    )
+    setup_servo = TwoDimensionalVisualServo(state="HOLD: STAGE 9 SETUP")
+    last_detection: RedTargetDetection | None = None
+    setup_debug_text_id = update_motion_debug_text(
+        f"STAGE 9 - {speed_level}: setup HOLD, camera ACTIVE",
+        None,
+        client_id,
+    )
+    prehold_steps = max(1, round(STAGE9_PRE_MOTION_HOLD_SECONDS / TIME_STEP))
+    setup_detection_seen = False
+    for setup_step in range(prehold_steps):
+        apply_constrained_arm_position_control(
+            robot_id,
+            arm_joint_indices,
+            commanded_joint_targets,
+            locked_initial_positions,
+            client_id,
+        )
+        p.stepSimulation(physicsClientId=client_id)
+        if setup_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+            update_camera_reference_axes(
+                robot_id,
+                client_id,
+                camera_axis_debug_item_ids,
+            )
+        detection = update_live_eye_in_hand_camera(
+            robot_id,
+            setup_step,
+            client_id,
+            camera_display,
+            _stage9_overlay_text(speed_level, 0.0, setup_servo, last_detection),
+        )
+        if detection is not None:
+            last_detection = detection
+            setup_detection_seen = setup_detection_seen or detection.detected
+        time.sleep(TIME_STEP)
+
+    trial_path = STAGE9_LOG_DIRECTORY / f"stage9_{speed_level.lower()}.csv"
+    cycle_fields = (
+        "time_s",
+        "trial",
+        "target_speed_level",
+        "target_frequency_hz",
+        "target_u",
+        "target_v",
+        "center_x",
+        "center_y",
+        "ex",
+        "ey",
+        "error_norm",
+        "target_detected",
+        "servo_state",
+        "delta_x_m",
+        "delta_y_m",
+        "ee_x",
+        "ee_y",
+        "ee_z",
+        "camera_x",
+        "camera_y",
+        "camera_z",
+        "target_world_x_log_only",
+        "target_world_y_log_only",
+        "target_world_z_log_only",
+    )
+    sample_ex: list[float] = []
+    sample_ey: list[float] = []
+    sample_norms: list[float] = []
+    total_frames = 0
+    detected_frames = 0
+    target_lost_count = 0
+    # A loss is an actual DETECTED -> LOST transition.  Do not count an
+    # initially unavailable first tracking frame as a loss event.
+    previous_detection_available = bool(
+        last_detection is not None and last_detection.detected
+    )
+    max_locked_deviation = 0.0
+    active_trial_start = capture_active_joint_hold_targets(
+        robot_id,
+        active_joint_indices,
+        client_id,
+    )
+    active_left_start_pose = False
+    returned_to_trial_start = False
+    servo = TwoDimensionalVisualServo()
+    debug_text_id = setup_debug_text_id
+    control_chain_diagnostics = ControlChainDiagnostics()
+    tracking_steps = max(1, round(STAGE9_DURATION_SECONDS / TIME_STEP))
+    wall_started_at = time.monotonic()
+
+    with trial_path.open("w", newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=cycle_fields)
+        writer.writeheader()
+        for tracking_step in range(tracking_steps):
+            simulation_time_s = tracking_step * TIME_STEP
+            target_world_position = _stage9_target_world_position(
+                simulation_time_s,
+                frequency_hz,
+            )
+            p.resetBasePositionAndOrientation(
+                target_body_id,
+                target_world_position,
+                (0.0, 0.0, 0.0, 1.0),
+                physicsClientId=client_id,
+            )
+            p.resetBaseVelocity(
+                target_body_id,
+                linearVelocity=_stage9_target_world_velocity(
+                    simulation_time_s,
+                    frequency_hz,
+                ),
+                angularVelocity=(0.0, 0.0, 0.0),
+                physicsClientId=client_id,
+            )
+            apply_constrained_arm_position_control(
+                robot_id,
+                arm_joint_indices,
+                commanded_joint_targets,
+                locked_initial_positions,
+                client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            control_chain_diagnostics.record_physics_step()
+
+            current_locked_deviations = get_locked_joint_deviations(
+                robot_id,
+                locked_initial_positions,
+                client_id,
+            )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                max((abs(value) for value in current_locked_deviations.values()), default=0.0),
+            )
+            current_active_positions = capture_active_joint_hold_targets(
+                robot_id,
+                active_joint_indices,
+                client_id,
+            )
+            active_start_distance = max(
+                abs(current_active_positions[index] - active_trial_start[index])
+                for index in active_joint_indices
+            )
+            active_left_start_pose = active_left_start_pose or active_start_distance > 0.01
+            if active_left_start_pose and active_start_distance < 0.006:
+                returned_to_trial_start = True
+
+            if tracking_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                update_camera_reference_axes(
+                    robot_id,
+                    client_id,
+                    camera_axis_debug_item_ids,
+                )
+            detection = update_live_eye_in_hand_camera(
+                robot_id,
+                tracking_step,
+                client_id,
+                camera_display,
+                _stage9_overlay_text(speed_level, simulation_time_s, servo, last_detection),
+            )
+            if detection is not None:
+                last_detection = detection
+                total_frames += 1
+                control_chain_diagnostics.record_camera_and_detection_frame()
+                if detection.detected:
+                    assert detection.pixel_error is not None
+                    ex, ey = detection.pixel_error
+                    error_norm = sqrt(ex * ex + ey * ey)
+                    sample_ex.append(float(ex))
+                    sample_ey.append(float(ey))
+                    sample_norms.append(error_norm)
+                    detected_frames += 1
+                elif previous_detection_available:
+                    target_lost_count += 1
+                previous_detection_available = detection.detected
+
+                previous_servo_state = servo.state
+                servo = _stage9_resume_dynamic_tracking_from_live_detection(servo, detection)
+                # The exact existing Stage 6E state machine is invoked with a
+                # live RGB detection. Suppressing only its verbose console
+                # diagnostics prevents logging overhead from reducing camera
+                # cadence; it does not alter state, IK, targets or motors.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    new_command = update_two_dimensional_visual_servo(
+                        servo,
+                        detection,
+                        robot_id,
+                        locked_joint_indices,
+                        locked_initial_positions,
+                        client_id,
+                    )
+                if servo.motion_completed:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    servo.motion_completed = False
+                if new_command is not None:
+                    control_chain_diagnostics.record_servo_command(servo)
+                    if (
+                        new_command.label.startswith("2D P step")
+                        and not servo.first_servo_command_logged
+                    ):
+                        current_pose_source_ok = print_visual_servo_current_pose_takeover(
+                            robot_id,
+                            arm_joint_indices,
+                            initial_arm_positions,
+                            detection,
+                            new_command,
+                            client_id,
+                            controlled_axis="2D",
+                        )
+                        servo.first_servo_command_logged = True
+                        if not current_pose_source_ok:
+                            servo.request_hold(
+                                "FAIL: FIRST TARGET NOT CURRENT POSE / HOLD"
+                            )
+                    if not servo.hold_requested:
+                        commanded_joint_targets = list(new_command.joint_targets)
+                if servo.hold_requested:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id,
+                        active_joint_indices,
+                        client_id,
+                    )
+                    commanded_joint_targets = build_hold_joint_targets(
+                        arm_joint_indices,
+                        locked_initial_positions,
+                        active_hold_targets,
+                    )
+                    servo.hold_requested = False
+
+                writer.writerow(
+                    _stage9_cycle_log_row(
+                        simulation_time_s,
+                        speed_level,
+                        frequency_hz,
+                        target_world_position,
+                        detection,
+                        servo,
+                        robot_id,
+                        client_id,
+                    )
+                )
+                log_file.flush()
+                if servo.state != previous_servo_state:
+                    print(f"Stage 9 {speed_level} servo state: {servo.state}")
+                debug_text_id = update_motion_debug_text(
+                    _stage9_gui_debug_text(
+                        speed_level,
+                        simulation_time_s,
+                        servo,
+                        detection,
+                    ),
+                    debug_text_id,
+                    client_id,
+                )
+            time.sleep(TIME_STEP)
+
+    wall_duration_s = time.monotonic() - wall_started_at
+    mean_abs_ex = sum(abs(value) for value in sample_ex) / len(sample_ex) if sample_ex else None
+    mean_abs_ey = sum(abs(value) for value in sample_ey) / len(sample_ey) if sample_ey else None
+    mean_error_norm = sum(sample_norms) / len(sample_norms) if sample_norms else None
+    rmse = (
+        sqrt(sum(value * value for value in sample_norms) / len(sample_norms))
+        if sample_norms
+        else None
+    )
+    peak_speed = 2.0 * pi * STAGE9_TARGET_SINE_AMPLITUDE_METRES * frequency_hz
+    summary: dict[str, object] = {
+        "speed_level": speed_level,
+        "target_motion_parameter": (
+            f"x(t)={STAGE9_TARGET_CENTER_WORLD[0]:.3f}+"
+            f"{STAGE9_TARGET_SINE_AMPLITUDE_METRES:.3f}sin(2pi*{frequency_hz:.3f}t) m; "
+            f"peak speed={peak_speed:.4f} m/s"
+        ),
+        "frequency_hz": frequency_hz,
+        "peak_target_speed_m_s": peak_speed,
+        "duration_s": tracking_steps * TIME_STEP,
+        "wall_duration_s": wall_duration_s,
+        "frames": total_frames,
+        "tracking_fps": total_frames / wall_duration_s if wall_duration_s > 0.0 else None,
+        "mean_abs_ex": mean_abs_ex,
+        "mean_abs_ey": mean_abs_ey,
+        "mean_error_norm": mean_error_norm,
+        "rmse": rmse,
+        "max_error_norm": max(sample_norms) if sample_norms else None,
+        "target_lost_count": target_lost_count,
+        "detection_rate_percent": 100.0 * detected_frames / total_frames if total_frames else 0.0,
+        "locked_joint_max_deviation": max_locked_deviation,
+        "return_to_initial": returned_to_trial_start,
+        "final_servo_state": servo.state,
+        "result": "COMPLETED" if setup_detection_seen else "SETUP FAILED",
+        "log_path": trial_path,
+    }
+    _print_stage9_trial_summary(summary)
+    return summary
+
+
+def _stage9_percentile(values: Sequence[float], percentile: float) -> float | None:
+    """Compute a deterministic linear percentile for Stage 9 reporting."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower = int(index)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = index - lower
+    return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+
+
+def _run_stage9_pure_dynamic_trial(
+    speed_level: str,
+    frequency_hz: float,
+    client_id: int,
+    camera_display: EyeInHandRgbDisplay,
+) -> dict[str, object]:
+    """Run Stage 9 Fix: static READY warm-up then pure dynamic measurement.
+
+    The warm-up uses the accepted static controller only until it has verified
+    five fresh frames in the existing ±2 px band.  The following 20 s CSV
+    contains dynamic measurements only, and its dynamic servo replaces the
+    current motor target on every fresh RGB frame.
+    """
+    p.resetSimulation(physicsClientId=client_id)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+    p.setGravity(0, 0, 0, physicsClientId=client_id)
+    p.setTimeStep(TIME_STEP, physicsClientId=client_id)
+    enable_pybullet_camera_debug_previews(client_id)
+    p.loadURDF("plane.urdf", physicsClientId=client_id)
+    robot_id = p.loadURDF(
+        "franka_panda/panda.urdf",
+        useFixedBase=True,
+        physicsClientId=client_id,
+    )
+    initial_arm_positions = print_panda_arm_joint_configuration(robot_id, client_id)
+    arm_joint_indices = get_panda_arm_joint_indices(robot_id, client_id)
+    arm_joint_names = get_panda_arm_joint_names(robot_id, client_id)
+    locked_joint_indices = [arm_joint_names[name] for name in BASELINE_LOCKED_JOINT_NAMES]
+    locked_initial_positions = {
+        index: initial_arm_positions[index] for index in locked_joint_indices
+    }
+    active_joint_indices = [
+        index for index in arm_joint_indices if index not in locked_joint_indices
+    ]
+    target_body_id = create_manual_draggable_red_ground_target(client_id)
+    target_orientation = (0.0, 0.0, 0.0, 1.0)
+    p.resetBasePositionAndOrientation(
+        target_body_id,
+        STAGE9_TARGET_CENTER_WORLD,
+        target_orientation,
+        physicsClientId=client_id,
+    )
+    p.resetBaseVelocity(
+        target_body_id,
+        linearVelocity=(0.0, 0.0, 0.0),
+        angularVelocity=(0.0, 0.0, 0.0),
+        physicsClientId=client_id,
+    )
+    camera_axis_debug_item_ids: list[int] = []
+    update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+
+    active_hold_targets = capture_active_joint_hold_targets(
+        robot_id, active_joint_indices, client_id
+    )
+    commanded_joint_targets = build_hold_joint_targets(
+        arm_joint_indices, locked_initial_positions, active_hold_targets
+    )
+    servo = TwoDimensionalVisualServo()
+    warmup_initial_error: float | None = None
+    ready_ex: int | None = None
+    ready_ey: int | None = None
+    ready_consecutive_frames = 0
+    ready = False
+    last_detection: RedTargetDetection | None = None
+    max_locked_deviation = 0.0
+    warmup_started_at = time.monotonic()
+    warmup_steps = max(1, round(STAGE9_WARMUP_MAX_SIMULATION_SECONDS / TIME_STEP))
+    debug_text_id = update_motion_debug_text(
+        f"STAGE 9 - {speed_level}\nPhase: WARM-UP\nCamera: ACTIVE",
+        None,
+        client_id,
+    )
+
+    for warmup_step in range(warmup_steps):
+        # The target remains exactly stationary until READY has been verified.
+        p.resetBasePositionAndOrientation(
+            target_body_id,
+            STAGE9_TARGET_CENTER_WORLD,
+            target_orientation,
+            physicsClientId=client_id,
+        )
+        apply_constrained_arm_position_control(
+            robot_id,
+            arm_joint_indices,
+            commanded_joint_targets,
+            locked_initial_positions,
+            client_id,
+        )
+        p.stepSimulation(physicsClientId=client_id)
+        locked_deviations = get_locked_joint_deviations(
+            robot_id, locked_initial_positions, client_id
+        )
+        max_locked_deviation = max(
+            max_locked_deviation,
+            max((abs(value) for value in locked_deviations.values()), default=0.0),
+        )
+        if warmup_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+            update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+        detection = update_live_eye_in_hand_camera(
+            robot_id,
+            warmup_step,
+            client_id,
+            camera_display,
+            _stage9_overlay_text(speed_level, 0.0, servo, last_detection) + " | Phase: WARM-UP",
+        )
+        if detection is not None:
+            last_detection = detection
+            if detection.detected:
+                assert detection.pixel_error is not None
+                ex, ey = detection.pixel_error
+                if warmup_initial_error is None:
+                    warmup_initial_error = sqrt(ex * ex + ey * ey)
+                if abs(ex) <= TWO_D_TOL_X_PIXELS and abs(ey) <= TWO_D_TOL_Y_PIXELS:
+                    ready_consecutive_frames += 1
+                else:
+                    ready_consecutive_frames = 0
+            else:
+                ready_consecutive_frames = 0
+            with contextlib.redirect_stdout(io.StringIO()):
+                new_command = _stage9_start_dynamic_tracking_from_current_pose(
+                    servo, detection, robot_id, locked_joint_indices,
+                    locked_initial_positions, client_id,
+                )
+            if new_command is not None and not servo.hold_requested:
+                commanded_joint_targets = list(new_command.joint_targets)
+            if servo.hold_requested:
+                active_hold_targets = capture_active_joint_hold_targets(
+                    robot_id, active_joint_indices, client_id
+                )
+                commanded_joint_targets = build_hold_joint_targets(
+                    arm_joint_indices, locked_initial_positions, active_hold_targets
+                )
+                servo.hold_requested = False
+            if ready_consecutive_frames >= TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED:
+                assert detection.pixel_error is not None
+                ready_ex, ready_ey = detection.pixel_error
+                ready = True
+                debug_text_id = update_motion_debug_text(
+                    f"STAGE 9 - {speed_level}\nPhase: READY\n"
+                    f"ex={ready_ex}, ey={ready_ey}; 5 fresh frames verified",
+                    debug_text_id,
+                    client_id,
+                )
+                break
+        time.sleep(TIME_STEP)
+
+    warmup_duration_s = (warmup_step + 1) * TIME_STEP
+    warmup_wall_duration_s = time.monotonic() - warmup_started_at
+    trial_path = STAGE9_LOG_DIRECTORY / f"stage9_{speed_level.lower()}.csv"
+    cycle_fields = (
+        "time_s", "trial", "target_speed_level", "target_frequency_hz",
+        "target_u", "target_v", "center_x", "center_y", "ex", "ey",
+        "error_norm", "target_detected", "servo_state", "servo_decision",
+        "ik_command_issued", "nonzero_correction_issued", "delta_x_m", "delta_y_m",
+        "ee_x", "ee_y", "ee_z", "camera_x", "camera_y", "camera_z",
+        "target_world_x_log_only", "target_world_y_log_only", "target_world_z_log_only",
+    )
+    if not ready:
+        with trial_path.open("w", newline="", encoding="utf-8") as log_file:
+            csv.DictWriter(log_file, fieldnames=cycle_fields).writeheader()
+        summary: dict[str, object] = {
+            "speed_level": speed_level,
+            "target_motion_parameter": f"x(t)={STAGE9_TARGET_CENTER_WORLD[0]:.3f}+{STAGE9_TARGET_SINE_AMPLITUDE_METRES:.3f}sin(2pi*{frequency_hz:.3f}t) m",
+            "frequency_hz": frequency_hz,
+            "peak_target_speed_m_s": 2.0 * pi * STAGE9_TARGET_SINE_AMPLITUDE_METRES * frequency_hz,
+            "warmup_duration_s": warmup_duration_s,
+            "warmup_wall_duration_s": warmup_wall_duration_s,
+            "warmup_initial_error": warmup_initial_error,
+            "ready_ex": ready_ex,
+            "ready_ey": ready_ey,
+            "duration_s": 0.0,
+            "wall_duration_s": 0.0,
+            "frames": 0,
+            "rgb_fps": None,
+            "detection_fps": None,
+            "servo_decision_fps": None,
+            "ik_command_fps": None,
+            "nonzero_correction_fps": None,
+            "tracking_fps": None,
+            "mean_abs_ex": None,
+            "mean_abs_ey": None,
+            "mean_error_norm": None,
+            "rmse": None,
+            "percentile_95_error_norm": None,
+            "max_error_norm": None,
+            "target_lost_count": 0,
+            "detection_rate_percent": 0.0,
+            "locked_joint_max_deviation": max_locked_deviation,
+            "return_to_initial": False,
+            "final_servo_state": "WARM-UP FAILED",
+            "result": "WARM-UP FAILED",
+            "log_path": trial_path,
+        }
+        _print_stage9_trial_summary(summary)
+        return summary
+
+    # Formal dynamic measurement starts only after READY. Reset dynamic servo
+    # state, retain the measured current hold pose, and start the sine at t=0.
+    servo = TwoDimensionalVisualServo()
+    active_hold_targets = capture_active_joint_hold_targets(
+        robot_id, active_joint_indices, client_id
+    )
+    commanded_joint_targets = build_hold_joint_targets(
+        arm_joint_indices, locked_initial_positions, active_hold_targets
+    )
+    active_trial_start = dict(active_hold_targets)
+    active_left_start_pose = False
+    returned_to_trial_start = False
+    tracking_steps = max(1, round(STAGE9_DURATION_SECONDS / TIME_STEP))
+    total_frames = detected_frames = servo_decisions = ik_commands = 0
+    nonzero_corrections = target_lost_count = 0
+    previous_detection_available = True
+    sample_ex: list[float] = []
+    sample_ey: list[float] = []
+    sample_norms: list[float] = []
+    wall_started_at = time.monotonic()
+
+    with trial_path.open("w", newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=cycle_fields)
+        writer.writeheader()
+        for tracking_step in range(tracking_steps):
+            simulation_time_s = tracking_step * TIME_STEP
+            target_world_position = _stage9_target_world_position(simulation_time_s, frequency_hz)
+            p.resetBasePositionAndOrientation(
+                target_body_id, target_world_position, target_orientation,
+                physicsClientId=client_id,
+            )
+            p.resetBaseVelocity(
+                target_body_id,
+                linearVelocity=_stage9_target_world_velocity(simulation_time_s, frequency_hz),
+                angularVelocity=(0.0, 0.0, 0.0),
+                physicsClientId=client_id,
+            )
+            apply_constrained_arm_position_control(
+                robot_id, arm_joint_indices, commanded_joint_targets,
+                locked_initial_positions, client_id,
+            )
+            p.stepSimulation(physicsClientId=client_id)
+            locked_deviations = get_locked_joint_deviations(
+                robot_id, locked_initial_positions, client_id
+            )
+            max_locked_deviation = max(
+                max_locked_deviation,
+                max((abs(value) for value in locked_deviations.values()), default=0.0),
+            )
+            current_active_positions = capture_active_joint_hold_targets(
+                robot_id, active_joint_indices, client_id
+            )
+            active_start_distance = max(
+                abs(current_active_positions[index] - active_trial_start[index])
+                for index in active_joint_indices
+            )
+            active_left_start_pose = active_left_start_pose or active_start_distance > 0.01
+            if active_left_start_pose and active_start_distance < 0.006:
+                returned_to_trial_start = True
+            if tracking_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                update_camera_reference_axes(robot_id, client_id, camera_axis_debug_item_ids)
+            detection = update_live_eye_in_hand_camera(
+                robot_id, tracking_step, client_id, camera_display,
+                _stage9_overlay_text(speed_level, simulation_time_s, servo, last_detection) + " | Phase: TRACKING",
+            )
+            if detection is not None:
+                last_detection = detection
+                total_frames += 1
+                servo_decisions += 1
+                ik_command_issued = False
+                nonzero_correction_issued = False
+                if detection.detected:
+                    assert detection.pixel_error is not None
+                    ex, ey = detection.pixel_error
+                    sample_ex.append(float(ex))
+                    sample_ey.append(float(ey))
+                    sample_norms.append(sqrt(ex * ex + ey * ey))
+                    detected_frames += 1
+                elif previous_detection_available:
+                    target_lost_count += 1
+                previous_detection_available = detection.detected
+
+                if servo.state.startswith("FAIL"):
+                    new_command = None
+                else:
+                    if servo.state == "TARGET LOST / HOLD" and detection.detected:
+                        servo = TwoDimensionalVisualServo()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        new_command = _stage9_start_dynamic_tracking_from_current_pose(
+                            servo, detection, robot_id, locked_joint_indices,
+                            locked_initial_positions, client_id,
+                        )
+                if new_command is not None and not servo.hold_requested:
+                    ik_command_issued = True
+                    ik_commands += 1
+                    nonzero_correction_issued = (
+                        abs(new_command.camera_delta_c[0]) > 1e-12
+                        or abs(new_command.camera_delta_c[1]) > 1e-12
+                    )
+                    nonzero_corrections += int(nonzero_correction_issued)
+                    commanded_joint_targets = list(new_command.joint_targets)
+                if servo.hold_requested:
+                    active_hold_targets = capture_active_joint_hold_targets(
+                        robot_id, active_joint_indices, client_id
+                    )
+                    commanded_joint_targets = build_hold_joint_targets(
+                        arm_joint_indices, locked_initial_positions, active_hold_targets
+                    )
+                    servo.hold_requested = False
+                writer.writerow(
+                    _stage9_cycle_log_row(
+                        simulation_time_s, speed_level, frequency_hz, target_world_position,
+                        detection, servo, ik_command_issued, nonzero_correction_issued,
+                        robot_id, client_id,
+                    )
+                )
+                if tracking_step % CAMERA_UPDATE_INTERVAL_STEPS == 0:
+                    debug_text_id = update_motion_debug_text(
+                        _stage9_gui_debug_text(
+                            speed_level, simulation_time_s, servo, detection
+                        ).replace("STAGE 9 - DYNAMIC TRACKING TEST", "STAGE 9\nPhase: TRACKING"),
+                        debug_text_id,
+                        client_id,
+                    )
+            time.sleep(TIME_STEP)
+
+    wall_duration_s = time.monotonic() - wall_started_at
+    peak_speed = 2.0 * pi * STAGE9_TARGET_SINE_AMPLITUDE_METRES * frequency_hz
+    rate = lambda count: count / wall_duration_s if wall_duration_s > 0.0 else None
+    summary = {
+        "speed_level": speed_level,
+        "target_motion_parameter": (
+            f"x(t)={STAGE9_TARGET_CENTER_WORLD[0]:.3f}+"
+            f"{STAGE9_TARGET_SINE_AMPLITUDE_METRES:.3f}sin(2pi*{frequency_hz:.3f}t) m; "
+            f"peak speed={peak_speed:.4f} m/s"
+        ),
+        "frequency_hz": frequency_hz,
+        "peak_target_speed_m_s": peak_speed,
+        "warmup_duration_s": warmup_duration_s,
+        "warmup_wall_duration_s": warmup_wall_duration_s,
+        "warmup_initial_error": warmup_initial_error,
+        "ready_ex": ready_ex,
+        "ready_ey": ready_ey,
+        "duration_s": tracking_steps * TIME_STEP,
+        "wall_duration_s": wall_duration_s,
+        "frames": total_frames,
+        "rgb_fps": rate(total_frames),
+        "detection_fps": rate(total_frames),
+        "servo_decision_fps": rate(servo_decisions),
+        "ik_command_fps": rate(ik_commands),
+        "nonzero_correction_fps": rate(nonzero_corrections),
+        "tracking_fps": rate(total_frames),
+        "mean_abs_ex": sum(abs(value) for value in sample_ex) / len(sample_ex) if sample_ex else None,
+        "mean_abs_ey": sum(abs(value) for value in sample_ey) / len(sample_ey) if sample_ey else None,
+        "mean_error_norm": sum(sample_norms) / len(sample_norms) if sample_norms else None,
+        "rmse": sqrt(sum(value * value for value in sample_norms) / len(sample_norms)) if sample_norms else None,
+        "percentile_95_error_norm": _stage9_percentile(sample_norms, 0.95),
+        "max_error_norm": max(sample_norms) if sample_norms else None,
+        "target_lost_count": target_lost_count,
+        "detection_rate_percent": 100.0 * detected_frames / total_frames if total_frames else 0.0,
+        "locked_joint_max_deviation": max_locked_deviation,
+        "return_to_initial": returned_to_trial_start,
+        "final_servo_state": servo.state,
+        "result": "COMPLETED",
+        "log_path": trial_path,
+    }
+    _print_stage9_trial_summary(summary)
+    return summary
+
+
+def run_stage9_dynamic_tracking_evaluation() -> None:
+    """Run the three frozen-controller dynamic tracking experiments."""
+    STAGE9_LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    client_id = p.connect(p.GUI)
+    if client_id < 0:
+        raise RuntimeError("Unable to open the PyBullet GUI for Stage 9.")
+    camera_display: EyeInHandRgbDisplay | None = None
+    try:
+        camera_display = EyeInHandRgbDisplay("Eye-in-Hand RGB - Stage 9")
+        print("Stage 9: Dynamic Target Tracking Performance Evaluation")
+        print("Frozen baseline: Stage 6E controller, camera, locks, IK, gains and HSV unchanged.")
+        print(
+            "Trajectory: x(t)=x0+A*sin(2*pi*f*t), "
+            f"A={STAGE9_TARGET_SINE_AMPLITUDE_METRES:.3f} m; y/z fixed."
+        )
+        print("Target world data is used only for motion and *_log_only CSV columns.")
+        summaries = [
+            _run_stage9_pure_dynamic_trial(speed_level, frequency_hz, client_id, camera_display)
+            for speed_level, frequency_hz in STAGE9_TRIAL_SPECS
+        ]
+        summary_path = STAGE9_LOG_DIRECTORY / "stage9_summary.csv"
+        summary_fields = (
+            "speed_level",
+            "target_motion_parameter",
+            "frequency_hz",
+            "peak_target_speed_m_s",
+            "warmup_duration_s",
+            "warmup_wall_duration_s",
+            "warmup_initial_error",
+            "ready_ex",
+            "ready_ey",
+            "duration_s",
+            "wall_duration_s",
+            "frames",
+            "rgb_fps",
+            "detection_fps",
+            "servo_decision_fps",
+            "ik_command_fps",
+            "nonzero_correction_fps",
+            "tracking_fps",
+            "mean_abs_ex",
+            "mean_abs_ey",
+            "mean_error_norm",
+            "rmse",
+            "percentile_95_error_norm",
+            "max_error_norm",
+            "target_lost_count",
+            "detection_rate_percent",
+            "locked_joint_max_deviation",
+            "return_to_initial",
+            "final_servo_state",
+            "result",
+        )
+        with summary_path.open("w", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=summary_fields)
+            writer.writeheader()
+            for summary in summaries:
+                writer.writerow({field: summary[field] for field in summary_fields})
+
+        completed_trials = [summary for summary in summaries if summary["result"] == "COMPLETED"]
+        print("\nStage 9 completion:")
+        for summary in summaries:
+            print(f"  {summary['speed_level']}: {summary['result']}")
+        print(f"Completed trials: {len(completed_trials)}/{len(summaries)}")
+        print("Summary CSV:", summary_path)
+        print(
+            "Controller world-coordinate access: CONFIRMED ABSENT "
+            "(world pose is motion/log-only)."
+        )
+        print(
+            "Stage 9:",
+            "PASS" if len(completed_trials) == len(STAGE9_TRIAL_SPECS) else "INCOMPLETE",
+        )
+    finally:
+        if camera_display is not None:
+            camera_display.close()
+        if p.isConnected(client_id):
+            p.disconnect(physicsClientId=client_id)
+
+
 def _capture_stage7_rgb_detection(
     robot_id: int,
     client_id: int,
@@ -5511,10 +6654,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 8A: drag the red target in the PyBullet GUI while RGB-only 2D tracking stays active.",
     )
+    parser.add_argument(
+        "--stage9",
+        action="store_true",
+        help="Run Stage 9's repeatable SLOW/MEDIUM/FAST dynamic-target evaluation and write CSV logs.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage9:
+        run_stage9_dynamic_tracking_evaluation()
     elif arguments.stage8_manual:
         run_stage8_manual_target_drag_gui()
     elif arguments.stage7_trial is not None:
