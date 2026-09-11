@@ -6659,10 +6659,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 9's repeatable SLOW/MEDIUM/FAST dynamic-target evaluation and write CSV logs.",
     )
+    parser.add_argument(
+        "--stage10",
+        action="store_true",
+        help="Run Stage 10 target-lost/recovery and visual-noise robustness experiments.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage10:
+        # Kept lazy because the experiment module imports this frozen Stage 9
+        # baseline and must never alter it during normal GUI startup.
+        from stage10_evaluation import run_stage10_robustness_evaluation
+
+        run_stage10_robustness_evaluation()
     elif arguments.stage9:
         run_stage9_dynamic_tracking_evaluation()
     elif arguments.stage8_manual:
