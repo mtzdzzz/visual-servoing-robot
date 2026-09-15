@@ -6664,10 +6664,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 10 target-lost/recovery and visual-noise robustness experiments.",
     )
+    parser.add_argument(
+        "--stage12-estimation",
+        action="store_true",
+        help="Run Stage 12 image-plane target motion estimation; prediction remains display/log-only.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage12_estimation:
+        # Kept lazy to keep all existing Stage 7--10 GUI modes independent.
+        from stage12_motion_estimation import run_stage12_motion_estimation
+
+        run_stage12_motion_estimation()
     elif arguments.stage10:
         # Kept lazy because the experiment module imports this frozen Stage 9
         # baseline and must never alter it during normal GUI startup.
