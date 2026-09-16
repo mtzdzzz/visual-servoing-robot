@@ -6669,10 +6669,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 12 image-plane target motion estimation; prediction remains display/log-only.",
     )
+    parser.add_argument(
+        "--stage13",
+        action="store_true",
+        help="Run Stage 13 baseline-vs-predicted-centroid visual-servo A/B evaluation.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage13:
+        # The Stage 13 module owns experiment scheduling only. It retains the
+        # frozen Stage 9 controller and supplies either raw or predicted RGB
+        # centroids as its sole experimental variable.
+        from stage13_evaluation import run_stage13_predictive_visual_servo_evaluation
+
+        run_stage13_predictive_visual_servo_evaluation()
     elif arguments.stage12_estimation:
         # Kept lazy to keep all existing Stage 7--10 GUI modes independent.
         from stage12_motion_estimation import run_stage12_motion_estimation
