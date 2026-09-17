@@ -124,6 +124,20 @@ class LiveCameraFrame:
 
 
 @dataclass(frozen=True)
+class LiveRGBDFrame:
+    """One synchronized RGB plus depth-buffer render from the fixed camera.
+
+    ``live_rgb_frame`` is deliberately the same data shape consumed by the
+    existing RGB detector.  Stage 14 uses this sibling type only to expose the
+    depth buffer returned by the *same* ``getCameraImage`` call; no existing
+    camera mounting, RGB detector, or real-time camera path is changed.
+    """
+
+    live_rgb_frame: LiveCameraFrame
+    depth_buffer: object
+
+
+@dataclass(frozen=True)
 class RedTargetDetection:
     """Result obtained strictly from one Eye-in-Hand RGB frame.
 
@@ -678,6 +692,65 @@ def render_live_eye_in_hand_rgb_frame(
         image_width=image_width,
         image_height=image_height,
         rgba_buffer=rgba_buffer,
+    )
+
+
+def render_live_eye_in_hand_rgbd_frame(
+    camera_reference_world_position: Sequence[float],
+    camera_reference_world_orientation: Sequence[float],
+    client_id: int,
+) -> LiveRGBDFrame:
+    """Render synchronized Eye-in-Hand RGB and PyBullet depth-buffer data.
+
+    The eye, target, up vector, view matrix, projection matrix, resolution,
+    and renderer selection are exactly the fixed-mount live RGB parameters.
+    The one difference is that the depth buffer from that *same* render is
+    retained for Stage 14 read-only RGB-D localization.
+    """
+
+    (
+        camera_world_position,
+        camera_world_orientation,
+        _,
+        camera_y_axis_world,
+        optical_axis_world,
+    ) = get_rigid_camera_pose(
+        camera_reference_world_position,
+        camera_reference_world_orientation,
+    )
+    render_parameters = build_camera_render_parameters(
+        camera_world_position,
+        [
+            position + direction
+            for position, direction in zip(camera_world_position, optical_axis_world)
+        ],
+        camera_y_axis_world,
+    )
+    connection_info = p.getConnectionInfo(physicsClientId=client_id)
+    renderer = (
+        p.ER_BULLET_HARDWARE_OPENGL
+        if connection_info.get("connectionMethod") == p.GUI
+        else p.ER_TINY_RENDERER
+    )
+    image_width, image_height, rgba_buffer, depth_buffer, _ = p.getCameraImage(
+        CAMERA_IMAGE_WIDTH,
+        CAMERA_IMAGE_HEIGHT,
+        viewMatrix=render_parameters.view_matrix,
+        projectionMatrix=render_parameters.projection_matrix,
+        renderer=renderer,
+        physicsClientId=client_id,
+    )
+    return LiveRGBDFrame(
+        live_rgb_frame=LiveCameraFrame(
+            camera_world_position=tuple(camera_world_position),
+            camera_world_orientation=tuple(camera_world_orientation),
+            optical_axis_world=tuple(optical_axis_world),
+            render_parameters=render_parameters,
+            image_width=image_width,
+            image_height=image_height,
+            rgba_buffer=rgba_buffer,
+        ),
+        depth_buffer=depth_buffer,
     )
 
 

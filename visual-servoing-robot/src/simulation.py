@@ -6674,10 +6674,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 13 baseline-vs-predicted-centroid visual-servo A/B evaluation.",
     )
+    parser.add_argument(
+        "--stage14-rgbd",
+        action="store_true",
+        help="Run Stage 14 static RGB-D red-target 3D localization evaluation.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage14_rgbd:
+        # Stage 14 owns only RGB-D capture/localization/evaluation.  It is
+        # lazy-loaded so existing robot-control and experiment entry points
+        # retain their accepted Stage 13 behaviour unchanged.
+        from stage14_rgbd_evaluation import run_stage14_rgbd_localization
+
+        run_stage14_rgbd_localization()
     elif arguments.stage13:
         # The Stage 13 module owns experiment scheduling only. It retains the
         # frozen Stage 9 controller and supplies either raw or predicted RGB
