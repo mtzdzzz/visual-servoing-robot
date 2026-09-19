@@ -194,7 +194,32 @@ class RGBDTargetLocalizer:
         camera_to_world: Sequence[Sequence[float]] | np.ndarray,
         render_to_camera: Sequence[Sequence[float]] | np.ndarray | None = None,
     ) -> RGBDLocalizationResult:
-        """Return a new valid position or an explicit non-stale invalid result."""
+        """Stage 14 red-target entry point; its geometry remains unchanged."""
+        try:
+            red_mask = _rgba_to_red_mask(
+                rgba_buffer, self.intrinsics.width, self.intrinsics.height
+            )
+        except (ValueError, cv2.error):
+            return self._invalid("INVALID_RGB_BUFFER", (u, v))
+        return self.localize_from_mask(
+            u, v, red_mask, depth_buffer, camera_to_world, render_to_camera
+        )
+
+    def localize_from_mask(
+        self,
+        u: int,
+        v: int,
+        target_mask: object,
+        depth_buffer: object,
+        camera_to_world: Sequence[Sequence[float]] | np.ndarray,
+        render_to_camera: Sequence[Sequence[float]] | np.ndarray | None = None,
+    ) -> RGBDLocalizationResult:
+        """Apply frozen Stage 14 geometry to one target's RGB-derived mask.
+
+        This interface extension retains exactly the Stage 14 depth conversion,
+        local median sampling, render-to-C conversion and sphere compensation.
+        No object ID or world-coordinate data is accepted.
+        """
 
         if not (0 <= u < self.intrinsics.width and 0 <= v < self.intrinsics.height):
             return self._invalid("PIXEL_OUT_OF_BOUNDS", (u, v))
@@ -208,6 +233,9 @@ class RGBDTargetLocalizer:
         )
         if axis_transform.shape != (3, 3) or not np.all(np.isfinite(axis_transform)):
             return self._invalid("INVALID_RENDER_TO_CAMERA_TRANSFORM", (u, v))
+        mask_array = np.asarray(target_mask)
+        if mask_array.shape != (self.intrinsics.height, self.intrinsics.width):
+            return self._invalid("INVALID_TARGET_MASK", (u, v))
         depth_array = np.asarray(depth_buffer, dtype=np.float64)
         if depth_array.size != self.intrinsics.width * self.intrinsics.height:
             return self._invalid("INVALID_DEPTH_BUFFER", (u, v))
@@ -215,18 +243,11 @@ class RGBDTargetLocalizer:
         if not np.all(np.isfinite(depth_array)):
             return self._invalid("NONFINITE_DEPTH_BUFFER", (u, v))
 
-        try:
-            red_mask = _rgba_to_red_mask(
-                rgba_buffer, self.intrinsics.width, self.intrinsics.height
-            )
-        except (ValueError, cv2.error):
-            return self._invalid("INVALID_RGB_BUFFER", (u, v))
-
         row_start = max(0, v - self.sample_half_window_pixels)
         row_end = min(self.intrinsics.height, v + self.sample_half_window_pixels + 1)
         column_start = max(0, u - self.sample_half_window_pixels)
         column_end = min(self.intrinsics.width, u + self.sample_half_window_pixels + 1)
-        local_mask = red_mask[row_start:row_end, column_start:column_end] > 0
+        local_mask = mask_array[row_start:row_end, column_start:column_end] > 0
         local_buffer = depth_array[row_start:row_end, column_start:column_end]
         local_metric = depth_buffer_to_metric_depth(
             local_buffer, self.near_plane_m, self.far_plane_m
@@ -241,7 +262,7 @@ class RGBDTargetLocalizer:
         buffer_samples = local_buffer[valid_mask]
         if metric_samples.size < self.minimum_depth_samples:
             return self._invalid(
-                "INSUFFICIENT_RED_DEPTH_SAMPLES",
+                "INSUFFICIENT_TARGET_DEPTH_SAMPLES",
                 (u, v),
                 sample_count=int(metric_samples.size),
             )

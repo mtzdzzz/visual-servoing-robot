@@ -6679,10 +6679,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 14 static RGB-D red-target 3D localization evaluation.",
     )
+    parser.add_argument(
+        "--stage15-multitarget",
+        action="store_true",
+        help="Run Stage 15 RGB-only RED/GREEN/BLUE multi-target RGB-D evaluation.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage15_multitarget:
+        # Stage 15 is a perception-only validation layer. Its lazy import
+        # leaves every existing Stage 13/14 controller and camera path intact.
+        from stage15_multitarget_evaluation import run_stage15_multitarget_perception
+
+        run_stage15_multitarget_perception()
     elif arguments.stage14_rgbd:
         # Stage 14 owns only RGB-D capture/localization/evaluation.  It is
         # lazy-loaded so existing robot-control and experiment entry points
