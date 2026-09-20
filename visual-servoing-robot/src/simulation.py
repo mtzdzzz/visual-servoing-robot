@@ -6684,10 +6684,32 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 15 RGB-only RED/GREEN/BLUE multi-target RGB-D evaluation.",
     )
+    parser.add_argument(
+        "--stage16-selection",
+        action="store_true",
+        help="Run indefinite Stage 16 manual RED/GREEN/BLUE selection and selected-target predictive servo.",
+    )
+    parser.add_argument(
+        "--stage16-eval",
+        action="store_true",
+        help="Run the finite Stage 16 scheduled five-switch evaluation and write its CSV/figures.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.stage16_selection:
+        # Manual Stage 16 has no timer, scheduled switch, experiment counter,
+        # or automatic exit. Only 1/2/3 change the selected target.
+        from stage16_target_switching import run_stage16_target_selection
+
+        run_stage16_target_selection()
+    elif arguments.stage16_eval:
+        # The finite, reproducible five-switch protocol is deliberately kept
+        # separate from the manual interactive demonstration.
+        from stage16_target_switching import run_stage16_evaluation
+
+        run_stage16_evaluation()
     elif arguments.stage15_multitarget:
         # Stage 15 is a perception-only validation layer. Its lazy import
         # leaves every existing Stage 13/14 controller and camera path intact.
