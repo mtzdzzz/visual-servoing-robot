@@ -6699,6 +6699,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 17 RGB-D yellow-obstacle perception and conservative occupancy evaluation.",
     )
+    parser.add_argument(
+        "--stage18-collision",
+        action="store_true",
+        help="Run Stage 18 vision-estimated-occupancy configuration/path collision evaluation.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
@@ -6721,6 +6726,12 @@ if __name__ == "__main__":
         from stage17_obstacle_evaluation import run_stage17_obstacle_perception
 
         run_stage17_obstacle_perception()
+    elif arguments.stage18_collision:
+        # Stage 18 consumes a fresh Stage 17 visual AABB in a separate DIRECT
+        # Panda model. It does not execute candidate paths or plan avoidance.
+        from stage18_collision_evaluation import run_stage18_collision_checking
+
+        run_stage18_collision_checking()
     elif arguments.stage15_multitarget:
         # Stage 15 is a perception-only validation layer. Its lazy import
         # leaves every existing Stage 13/14 controller and camera path intact.
