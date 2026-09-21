@@ -6694,6 +6694,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Run the finite Stage 16 scheduled five-switch evaluation and write its CSV/figures.",
     )
+    parser.add_argument(
+        "--stage17-obstacle",
+        action="store_true",
+        help="Run Stage 17 RGB-D yellow-obstacle perception and conservative occupancy evaluation.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
@@ -6710,6 +6715,12 @@ if __name__ == "__main__":
         from stage16_target_switching import run_stage16_evaluation
 
         run_stage16_evaluation()
+    elif arguments.stage17_obstacle:
+        # Stage 17 is perception-only: its RGB-D obstacle occupancy estimate
+        # is never connected to collision checking, planning, or the Panda.
+        from stage17_obstacle_evaluation import run_stage17_obstacle_perception
+
+        run_stage17_obstacle_perception()
     elif arguments.stage15_multitarget:
         # Stage 15 is a perception-only validation layer. Its lazy import
         # leaves every existing Stage 13/14 controller and camera path intact.
