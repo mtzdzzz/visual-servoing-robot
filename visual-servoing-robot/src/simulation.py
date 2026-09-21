@@ -6704,6 +6704,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 18 vision-estimated-occupancy configuration/path collision evaluation.",
     )
+    parser.add_argument(
+        "--stage19-rrt-connect",
+        action="store_true",
+        help="Run Stage 19 RRT-Connect planning/validation without executing any candidate robot path.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
@@ -6732,6 +6737,13 @@ if __name__ == "__main__":
         from stage18_collision_evaluation import run_stage18_collision_checking
 
         run_stage18_collision_checking()
+    elif arguments.stage19_rrt_connect:
+        # Stage 19 receives only a fresh visual occupancy from Stage 17/18,
+        # plans with its own DIRECT collision model, and never executes the
+        # red direct path or the green RRT path on the GUI Panda.
+        from stage19_rrt_connect_evaluation import run_stage19_rrt_connect_planning
+
+        run_stage19_rrt_connect_planning()
     elif arguments.stage15_multitarget:
         # Stage 15 is a perception-only validation layer. Its lazy import
         # leaves every existing Stage 13/14 controller and camera path intact.
