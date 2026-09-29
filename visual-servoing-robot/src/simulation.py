@@ -6709,6 +6709,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Stage 19 RRT-Connect planning/validation without executing any candidate robot path.",
     )
+    parser.add_argument(
+        "--stage20-execute", action="store_true",
+        help="Align RED safely, HOLD, then use 1/2/3 for collision-checked manual target switching.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
@@ -6737,6 +6741,10 @@ if __name__ == "__main__":
         from stage18_collision_evaluation import run_stage18_collision_checking
 
         run_stage18_collision_checking()
+    elif arguments.stage20_execute:
+        from stage20_target_alignment import run_stage20_selection
+
+        run_stage20_selection()
     elif arguments.stage19_rrt_connect:
         # Stage 19 receives only a fresh visual occupancy from Stage 17/18,
         # plans with its own DIRECT collision model, and never executes the
