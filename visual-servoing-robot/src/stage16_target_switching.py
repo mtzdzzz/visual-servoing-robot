@@ -385,6 +385,8 @@ def _create_multitarget_ready_context(
     detector: MultiTargetDetector,
     manager: TargetManager,
     mode_title: str,
+    realtime: bool = True,
+    perform_warmup: bool = True,
 ) -> tuple[stage10.ReadyContext, dict[str, int]]:
     """Create all Stage 16 targets before a RED-only WARM-UP.
 
@@ -444,10 +446,18 @@ def _create_multitarget_ready_context(
     warmup_steps = max(1, round(sim.STAGE9_WARMUP_MAX_SIMULATION_SECONDS / sim.TIME_STEP))
     print("Stage 16 scene initialized: RED + GREEN + BLUE exist before WARM-UP; selected target: RED.")
 
+    if not perform_warmup:
+        # Stage 21's interactive showcase starts immediately. The same frozen
+        # controller aligns RED in its ordinary tracking loop, while 1/2/3 and
+        # quit input are already responsive from the first displayed frame.
+        print("Stage 21 integration: immediate manual tracking; no experiment READY gate.")
+        return context, target_body_ids
+
     for step in range(warmup_steps):
         stage10._step_physics(context, client_id)
         if step % sim.CAMERA_UPDATE_INTERVAL_STEPS != 0:
-            time.sleep(sim.TIME_STEP)
+            if realtime:
+                time.sleep(sim.TIME_STEP)
             continue
 
         sim.update_camera_reference_axes(robot_id, client_id, axis_ids)
@@ -510,7 +520,8 @@ def _create_multitarget_ready_context(
                 f"RED ex/ey=({context.ready_ex}, {context.ready_ey})."
             )
             return context, target_body_ids
-        time.sleep(sim.TIME_STEP)
+        if realtime:
+            time.sleep(sim.TIME_STEP)
 
     raise RuntimeError("Stage 16 WARM-UP did not reach RED READY within the protocol limit.")
 

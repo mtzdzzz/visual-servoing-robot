@@ -49,10 +49,13 @@ class UserExit(Exception):
 
 
 class Demo:
-    def __init__(self, gui, realtime, log_name="stage20_demo_execution.jsonl"):
+    def __init__(self, gui, realtime, log_name="stage20_demo_execution.jsonl",
+                 mode_title="STAGE 20 - FIXED SINGLE DEMO",
+                 window_title="Stage 20 - Obstacle-Aware Execution"):
         self.client = p.connect(p.GUI if gui else p.DIRECT)
         self.gui, self.realtime = gui, realtime
-        self.display = EyeInHandRgbDisplay("Stage 20 - Obstacle-Aware Execution") if gui else None
+        self.mode_title = mode_title
+        self.display = EyeInHandRgbDisplay(window_title) if gui else None
         self.display_was_open = bool(self.display and self.display.is_open)
         self.checker = CollisionChecker()
         self.state, self.source = "IDLE", "NONE"
@@ -159,7 +162,7 @@ class Demo:
         self.debug_id = sim.update_motion_debug_text(text, self.debug_id, self.client)
         if self.display:
             rgba = np.asarray(frame.rgba_buffer, dtype=np.uint8).reshape(frame.image_height, frame.image_width, 4).copy()
-            lines = ["STAGE 20 - FIXED SINGLE DEMO", f"STATE: {self.state}",
+            lines = [self.mode_title, f"STATE: {self.state}",
                      f"Execution source: {self.source}", "Q / ESC: quit | No auto restart"]
             if self.executor:
                 lines += [f"Waypoint: {self.executor.index + 1} / {len(self.executor.path)}",
@@ -275,6 +278,7 @@ class Demo:
         stage19._draw_waypoint_path([start, goal], self.checker, self.client, (1, 0, 0) if direct.collision else (0, 1, 0), 2, "DIRECT")
         if direct.collision:
             self.source = "RRT_CONNECT"
+            self.set_state("DIRECT_COLLISION")
             self.set_state("RRT_PLANNING")
             config = RRTConnectConfig(random_seed=seed)  # unchanged Stage19 defaults
             result = RRTConnectPlanner(self.checker, self.occupancy, (4, 5, 6), locks,
@@ -372,17 +376,20 @@ class Demo:
             p.disconnect(physicsClientId=self.client)
 
 
-def run_stage20_demo(*, gui=True, realtime=True, keep_open=True, seed=DEMO_SEED):
+def run_stage20_demo(*, gui=True, realtime=True, keep_open=True, seed=DEMO_SEED,
+                     mode_title="STAGE 20 - FIXED SINGLE DEMO",
+                     window_title="Stage 20 - Obstacle-Aware Execution"):
     """CLI keeps the SAME scene in HOLD/SAFE_STOP until Q/ESC/window close.
 
     Headless bounded tests may set keep_open=False; CLI never does.
     """
-    demo = Demo(gui, realtime)
+    demo = Demo(gui, realtime, mode_title=mode_title, window_title=window_title)
     print("DEBUG_STAGE20 =", DEBUG_STAGE20)
     print("GT used for planning/execution/controller: False; contacts: evaluation only")
     print("Self-collision checking: NOT IMPLEMENTED")
     try:
         try:
+            demo.set_state("INITIALIZE")
             demo.initialize()
             demo.perceive()
             demo.plan(seed)

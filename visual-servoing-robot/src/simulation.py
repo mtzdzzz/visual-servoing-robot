@@ -6713,10 +6713,34 @@ if __name__ == "__main__":
         "--stage20-execute", action="store_true",
         help="Align RED safely, HOLD, then use 1/2/3 for collision-checked manual target switching.",
     )
+    parser.add_argument(
+        "--demo-tracking", action="store_true",
+        help="Predictive visual tracking demo with a mouse-draggable RED target.",
+    )
+    parser.add_argument(
+        "--demo-multitarget", action="store_true",
+        help="Manual RGB-D multi-target selection demo (1=RED, 2=GREEN, 3=BLUE).",
+    )
+    parser.add_argument(
+        "--demo-obstacle", action="store_true",
+        help="Deterministic obstacle-aware RRT execution demo.",
+    )
     arguments = parser.parse_args()
 
     if arguments.inspect:
         inspect_panda_structure()
+    elif arguments.demo_tracking:
+        from demo_tracking import run_demo_tracking
+
+        run_demo_tracking()
+    elif arguments.demo_multitarget:
+        from demo_multitarget import run_demo_multitarget
+
+        run_demo_multitarget()
+    elif arguments.demo_obstacle:
+        from demo_obstacle import run_demo_obstacle
+
+        run_demo_obstacle()
     elif arguments.stage16_selection:
         # Manual Stage 16 has no timer, scheduled switch, experiment counter,
         # or automatic exit. Only 1/2/3 change the selected target.
