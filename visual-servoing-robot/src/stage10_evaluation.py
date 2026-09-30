@@ -8,10 +8,7 @@ detector thresholds.
 
 from __future__ import annotations
 
-import contextlib
 import csv
-from dataclasses import dataclass
-import io
 from math import pi, sqrt
 from pathlib import Path
 import random
@@ -19,10 +16,12 @@ import time
 from typing import Callable, Sequence
 
 import pybullet as p
-import pybullet_data
 
-import simulation as sim
-from camera_observation import EyeInHandRgbDisplay, RedTargetDetection, create_manual_draggable_red_ground_target
+import robotics_core as sim
+from camera_observation import EyeInHandRgbDisplay, RedTargetDetection
+from visual_servo_runtime import (
+    ReadyContext, create_ready_context, control_latest_measurement, step_physics,
+)
 
 
 LOG_DIRECTORY = Path(__file__).resolve().parents[1] / "outputs" / "logs"
@@ -33,26 +32,6 @@ TARGET_LOST_HIDDEN_WORLD = (-0.80, 0.80, sim.GROUND_TARGET_RADIUS)
 NOISE_DURATION_SECONDS = sim.STAGE9_DURATION_SECONDS
 NOISE_LEVELS_PIXELS = (0.0, 1.0, 3.0)
 NOISE_RANDOM_SEED = 20260911
-
-
-@dataclass
-class ReadyContext:
-    robot_id: int
-    target_body_id: int
-    arm_joint_indices: list[int]
-    active_joint_indices: list[int]
-    locked_joint_indices: list[int]
-    locked_initial_positions: dict[int, float]
-    commanded_joint_targets: list[float]
-    active_hold_targets: dict[int, float]
-    servo: sim.TwoDimensionalVisualServo
-    camera_axis_debug_item_ids: list[int]
-    debug_text_id: int | None
-    warmup_duration_s: float
-    warmup_initial_error: float | None
-    ready_ex: int | None
-    ready_ey: int | None
-    max_locked_deviation: float
 
 
 def _percentile(values: Sequence[float], percentile: float = 0.95) -> float | None:
@@ -109,116 +88,6 @@ def _build_noisy_measurement(
         noise_u,
         noise_v,
     )
-
-
-def _create_ready_context(client_id: int, camera_display: EyeInHandRgbDisplay, label: str) -> ReadyContext:
-    """Reset a repeatable robot state and verify visual READY before a test."""
-    p.resetSimulation(physicsClientId=client_id)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
-    p.setGravity(0, 0, 0, physicsClientId=client_id)
-    p.setTimeStep(sim.TIME_STEP, physicsClientId=client_id)
-    sim.enable_pybullet_camera_debug_previews(client_id)
-    p.loadURDF("plane.urdf", physicsClientId=client_id)
-    robot_id = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True, physicsClientId=client_id)
-    initial_positions = sim.print_panda_arm_joint_configuration(robot_id, client_id)
-    arm_joint_indices = sim.get_panda_arm_joint_indices(robot_id, client_id)
-    arm_joint_names = sim.get_panda_arm_joint_names(robot_id, client_id)
-    locked_indices = [arm_joint_names[name] for name in sim.BASELINE_LOCKED_JOINT_NAMES]
-    locked_positions = {index: initial_positions[index] for index in locked_indices}
-    active_indices = [index for index in arm_joint_indices if index not in locked_indices]
-    target_body_id = create_manual_draggable_red_ground_target(client_id)
-    target_orientation = (0.0, 0.0, 0.0, 1.0)
-    p.resetBasePositionAndOrientation(
-        target_body_id, sim.STAGE9_TARGET_CENTER_WORLD, target_orientation, physicsClientId=client_id
-    )
-    axis_ids: list[int] = []
-    sim.update_camera_reference_axes(robot_id, client_id, axis_ids)
-    active_hold = sim.capture_active_joint_hold_targets(robot_id, active_indices, client_id)
-    commanded = sim.build_hold_joint_targets(arm_joint_indices, locked_positions, active_hold)
-    servo = sim.TwoDimensionalVisualServo()
-    ready_frames = 0
-    warmup_initial_error: float | None = None
-    max_locked_deviation = 0.0
-    debug_text_id = sim.update_motion_debug_text(
-        f"STAGE 10\n{label}\nPhase: WARM-UP", None, client_id
-    )
-    warmup_steps = max(1, round(sim.STAGE9_WARMUP_MAX_SIMULATION_SECONDS / sim.TIME_STEP))
-    for step in range(warmup_steps):
-        p.resetBasePositionAndOrientation(
-            target_body_id, sim.STAGE9_TARGET_CENTER_WORLD, target_orientation, physicsClientId=client_id
-        )
-        sim.apply_constrained_arm_position_control(
-            robot_id, arm_joint_indices, commanded, locked_positions, client_id
-        )
-        p.stepSimulation(physicsClientId=client_id)
-        deviations = sim.get_locked_joint_deviations(robot_id, locked_positions, client_id)
-        max_locked_deviation = max(max_locked_deviation, max(map(abs, deviations.values()), default=0.0))
-        if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
-            sim.update_camera_reference_axes(robot_id, client_id, axis_ids)
-        raw_detection = sim.update_live_eye_in_hand_camera(
-            robot_id, step, client_id, camera_display, f"STAGE 10 {label} | Phase: WARM-UP"
-        )
-        if raw_detection is not None:
-            if raw_detection.detected:
-                assert raw_detection.pixel_error is not None
-                ex, ey = raw_detection.pixel_error
-                if warmup_initial_error is None:
-                    warmup_initial_error = sqrt(ex * ex + ey * ey)
-                ready_frames = ready_frames + 1 if abs(ex) <= 2 and abs(ey) <= 2 else 0
-            else:
-                ready_frames = 0
-            with contextlib.redirect_stdout(io.StringIO()):
-                command = sim._stage9_start_dynamic_tracking_from_current_pose(
-                    servo, raw_detection, robot_id, locked_indices, locked_positions, client_id
-                )
-            if command is not None and not servo.hold_requested:
-                commanded = list(command.joint_targets)
-            if servo.hold_requested:
-                active_hold = sim.capture_active_joint_hold_targets(robot_id, active_indices, client_id)
-                commanded = sim.build_hold_joint_targets(arm_joint_indices, locked_positions, active_hold)
-                servo.hold_requested = False
-            if ready_frames >= sim.TWO_D_PRECISION_SETTLE_FRAMES_REQUIRED:
-                assert raw_detection.pixel_error is not None
-                return ReadyContext(
-                    robot_id, target_body_id, arm_joint_indices, active_indices, locked_indices,
-                    locked_positions, commanded, active_hold, sim.TwoDimensionalVisualServo(), axis_ids,
-                    debug_text_id, (step + 1) * sim.TIME_STEP, warmup_initial_error,
-                    raw_detection.pixel_error[0], raw_detection.pixel_error[1], max_locked_deviation,
-                )
-        time.sleep(sim.TIME_STEP)
-    raise RuntimeError(f"Stage 10 {label}: WARM-UP did not reach READY within the protocol limit.")
-
-
-def _control_latest_measurement(
-    context: ReadyContext, measurement: RedTargetDetection, client_id: int
-) -> tuple[bool, bool]:
-    """Apply the frozen latest-observation controller and return command flags."""
-    if context.servo.state.startswith("FAIL"):
-        return False, False
-    if context.servo.state == "TARGET LOST / HOLD" and measurement.detected:
-        context.servo = sim.TwoDimensionalVisualServo()
-    with contextlib.redirect_stdout(io.StringIO()):
-        command = sim._stage9_start_dynamic_tracking_from_current_pose(
-            context.servo, measurement, context.robot_id, context.locked_joint_indices,
-            context.locked_initial_positions, client_id
-        )
-    ik_command_issued = command is not None and not context.servo.hold_requested
-    nonzero_correction = bool(
-        ik_command_issued
-        and command is not None
-        and (abs(command.camera_delta_c[0]) > 1e-12 or abs(command.camera_delta_c[1]) > 1e-12)
-    )
-    if ik_command_issued and command is not None:
-        context.commanded_joint_targets = list(command.joint_targets)
-    if context.servo.hold_requested:
-        context.active_hold_targets = sim.capture_active_joint_hold_targets(
-            context.robot_id, context.active_joint_indices, client_id
-        )
-        context.commanded_joint_targets = sim.build_hold_joint_targets(
-            context.arm_joint_indices, context.locked_initial_positions, context.active_hold_targets
-        )
-        context.servo.hold_requested = False
-    return ik_command_issued, nonzero_correction
 
 
 def _stage10_csv_fields() -> tuple[str, ...]:
@@ -301,20 +170,6 @@ def _apply_target_pose(target_body_id: int, position: Sequence[float], client_id
     )
 
 
-def _step_physics(context: ReadyContext, client_id: int) -> None:
-    sim.apply_constrained_arm_position_control(
-        context.robot_id, context.arm_joint_indices, context.commanded_joint_targets,
-        context.locked_initial_positions, client_id,
-    )
-    p.stepSimulation(physicsClientId=client_id)
-    deviations = sim.get_locked_joint_deviations(
-        context.robot_id, context.locked_initial_positions, client_id
-    )
-    context.max_locked_deviation = max(
-        context.max_locked_deviation, max(map(abs, deviations.values()), default=0.0)
-    )
-
-
 def _episode_metrics(errors: Sequence[float], detected_frames: int, total_frames: int) -> dict[str, float | int | None]:
     values = _metric(errors)
     values["detection_rate"] = 100.0 * detected_frames / total_frames if total_frames else 0.0
@@ -394,7 +249,7 @@ def _run_target_lost_recovery_trial(
     camera_display: EyeInHandRgbDisplay,
 ) -> dict[str, object]:
     """Run an out-of-view interval and verify vision-only automatic recovery."""
-    context = _create_ready_context(client_id, camera_display, "TARGET LOST / RECOVERY")
+    context = create_ready_context(client_id, camera_display, "TARGET LOST / RECOVERY")
     log_path = LOG_DIRECTORY / "stage10_target_lost.csv"
     target_orientation = (0.0, 0.0, 0.0, 1.0)
     total_steps = max(1, round(TARGET_LOST_DURATION_SECONDS / sim.TIME_STEP))
@@ -430,7 +285,7 @@ def _run_target_lost_recovery_trial(
                 angularVelocity=(0.0, 0.0, 0.0),
                 physicsClientId=client_id,
             )
-            _step_physics(context, client_id)
+            step_physics(context, client_id)
             if lost_hold_reference is not None:
                 current_active = sim.capture_active_joint_hold_targets(
                     context.robot_id, context.active_joint_indices, client_id
@@ -489,7 +344,7 @@ def _run_target_lost_recovery_trial(
                 lost_hold_reference = None
             previously_detected = raw_detection.detected
 
-            ik_command_issued, nonzero_correction = _control_latest_measurement(
+            ik_command_issued, nonzero_correction = control_latest_measurement(
                 context, raw_detection, client_id
             )
             if raw_detection.detected and recovery_start_s is not None and recovery_time_s is None:
@@ -539,7 +394,7 @@ def _run_noise_trial(
 ) -> dict[str, object]:
     """Run the frozen MEDIUM motion with noise only on the RGB measurement."""
     condition = f"{standard_deviation_pixels:g} px"
-    context = _create_ready_context(client_id, camera_display, f"VISUAL NOISE {condition}")
+    context = create_ready_context(client_id, camera_display, f"VISUAL NOISE {condition}")
     suffix = str(int(standard_deviation_pixels))
     log_path = LOG_DIRECTORY / f"stage10_noise_{suffix}.csv"
     random_generator = random.Random(NOISE_RANDOM_SEED)
@@ -565,7 +420,7 @@ def _run_noise_trial(
                 angularVelocity=(0.0, 0.0, 0.0),
                 physicsClientId=client_id,
             )
-            _step_physics(context, client_id)
+            step_physics(context, client_id)
             if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                 sim.update_camera_reference_axes(
                     context.robot_id, client_id, context.camera_axis_debug_item_ids
@@ -597,7 +452,7 @@ def _run_noise_trial(
             measurement, noise_u, noise_v = _build_noisy_measurement(
                 raw_detection, random_generator, standard_deviation_pixels
             )
-            ik_command_issued, nonzero_correction = _control_latest_measurement(
+            ik_command_issued, nonzero_correction = control_latest_measurement(
                 context, measurement, client_id
             )
             ik_command_count += int(ik_command_issued)

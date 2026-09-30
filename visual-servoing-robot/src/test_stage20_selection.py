@@ -117,7 +117,7 @@ class SelectionTests(unittest.TestCase):
         with patch.object(SelectedTargetDemo, 'render', return_value=NS(live_rgb_frame=frame)), \
              patch('stage20_target_alignment.cv2.imwrite'), \
              patch('stage20_target_alignment.sim.update_motion_debug_text', return_value=1), \
-             patch('stage20_target_alignment.control._control_latest_measurement', return_value=(False, False)) as controller:
+             patch('stage20_target_alignment.control.control_latest_measurement', return_value=(False, False)) as controller:
             d.observation()
             return controller.call_count
 

@@ -1,4 +1,4 @@
-"""Stage 15 multi-target RGB-D perception validation.
+﻿"""Stage 15 multi-target RGB-D perception validation.
 
 The frozen robot, camera and Stage 14 geometry remain unchanged.  This module
 adds only RGB-based RED/GREEN/BLUE detection, passes each colour's own mask to
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from math import sqrt
 from pathlib import Path
 import time
 from typing import Sequence
@@ -19,9 +18,10 @@ import cv2
 import numpy as np
 import pybullet as p
 
-import simulation as sim
-import stage14_rgbd_evaluation as stage14
-import stage10_evaluation as stage10
+import robotics_core as sim
+import camera_geometry
+import scene_factory
+import visual_servo_runtime as runtime
 from camera_observation import (
     CAMERA_FAR_PLANE,
     CAMERA_FOV_Y_DEGREES,
@@ -31,13 +31,11 @@ from camera_observation import (
     render_live_eye_in_hand_rgbd_frame,
 )
 from multi_target_detector import (
-    TARGET_CLASSES,
     DetectedTarget,
     MultiTargetDetector,
     annotate_multi_target_detections,
 )
 from rgbd_localization import (
-    CameraIntrinsics,
     DepthStatistics,
     RGBDLocalizationResult,
     RGBDTargetLocalizer,
@@ -388,7 +386,7 @@ def run_stage15_multitarget_perception() -> None:
                 # prevents renderer/physics state from a previous scene becoming
                 # an unrecorded experimental variable; no visual-servo command is
                 # issued by this setup helper.
-                context = stage14._create_static_localization_context(client_id)
+                context = scene_factory.create_static_localization_context(client_id)
                 # Stage 14 creates the red sphere.  Stage 15 adds independent
                 # static green and blue spheres for this scene only.
                 target_body_ids: dict[str, int] = {"target_1": context.target_body_id}
@@ -400,7 +398,7 @@ def run_stage15_multitarget_perception() -> None:
                 }
                 for spec in TARGET_SPECS:
                     _set_target_pose(target_body_ids[spec.target_id], configuration[spec.target_id], client_id)
-                stage14._run_hold_steps(context, round(SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
+                scene_factory.run_hold_steps(context, round(SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
                 simulation_time_s += SCENE_SETTLE_SECONDS
                 valid_all_frames = 0
                 capture_steps = 0
@@ -411,7 +409,7 @@ def run_stage15_multitarget_perception() -> None:
                     context.debug_text_id, client_id,
                 )
                 while valid_all_frames < SAMPLES_PER_SCENE and capture_steps < max_steps:
-                    stage10._step_physics(context, client_id)
+                    runtime.step_physics(context, client_id)
                     simulation_time_s += sim.TIME_STEP
                     if capture_steps % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                         sim.update_camera_reference_axes(
@@ -426,10 +424,10 @@ def run_stage15_multitarget_perception() -> None:
                         frame = rgbd_frame.live_rgb_frame
                         detections = detector.detect(frame.rgba_buffer, frame.image_width, frame.image_height)
                         detection_by_id = {detection.target_id: detection for detection in detections}
-                        camera_to_world, _, _ = stage14._validate_camera_pose_and_render_frame(
+                        camera_to_world, _, _ = camera_geometry.validate_camera_pose_and_render_frame(
                             context.robot_id, frame, client_id
                         )
-                        current_transform = stage14._render_to_camera_axis_transform(camera_to_world, frame)
+                        current_transform = camera_geometry.render_to_camera_axis_transform(camera_to_world, frame)
                         if render_to_camera is None:
                             render_to_camera = current_transform
                             print("C_render -> C axis transform:\n" + np.array2string(render_to_camera, precision=5, suppress_small=True))
@@ -547,3 +545,4 @@ def run_stage15_multitarget_perception() -> None:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

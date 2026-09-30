@@ -1,4 +1,4 @@
-"""Stage 12 image-plane motion-estimation experiment.
+﻿"""Stage 12 image-plane motion-estimation experiment.
 
 Only the experiment scheduler moves the simulated red target.  The estimator
 accepts timestamped OpenCV centroids only, while the frozen Stage 9 controller
@@ -20,8 +20,8 @@ import numpy as np
 import pandas as pd
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as stage10
+import robotics_core as sim
+import visual_servo_runtime as runtime
 from camera_observation import (
     EyeInHandRgbDisplay,
     LiveCameraFrame,
@@ -107,7 +107,7 @@ def _stage12_overlay(
 
 
 def _capture_stage12_rgb(
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     simulation_time_s: float,
     estimator: TargetMotionEstimator,
     camera_display: EyeInHandRgbDisplay,
@@ -139,7 +139,7 @@ def _log_row(
     simulation_time_s: float,
     raw_detection: RedTargetDetection,
     estimate: MotionEstimate | None,
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     ik_command_issued: bool,
     nonzero_correction_issued: bool,
 ) -> dict[str, object]:
@@ -278,7 +278,7 @@ def run_stage12_motion_estimation() -> None:
         print("Stage 12: Target Motion Estimation")
         print("Estimator input: timestamp + raw RGB/OpenCV centroid only.")
         print("Controller input: CURRENT raw RGB/OpenCV detection only; prediction is display/log-only.")
-        context = stage10._create_ready_context(client_id, camera_display, "STAGE 12 WARM-UP")
+        context = runtime.create_ready_context(client_id, camera_display, "STAGE 12 WARM-UP")
         estimator = TargetMotionEstimator(DEFAULT_EMA_ALPHA, DEFAULT_PREDICTION_HORIZON_SECONDS)
         total_steps = max(1, round(STAGE12_DURATION_SECONDS / sim.TIME_STEP))
         target_orientation = (0.0, 0.0, 0.0, 1.0)
@@ -313,7 +313,7 @@ def run_stage12_motion_estimation() -> None:
                     ),
                     angularVelocity=(0.0, 0.0, 0.0), physicsClientId=client_id,
                 )
-                stage10._step_physics(context, client_id)
+                runtime.step_physics(context, client_id)
                 if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                     sim.update_camera_reference_axes(
                         context.robot_id, client_id, context.camera_axis_debug_item_ids
@@ -322,7 +322,7 @@ def run_stage12_motion_estimation() -> None:
                         context, simulation_time_s, estimator, camera_display, client_id
                     )
                     last_detection = raw_detection
-                    ik_command_issued, nonzero_correction_issued = stage10._control_latest_measurement(
+                    ik_command_issued, nonzero_correction_issued = runtime.control_latest_measurement(
                         context, raw_detection, client_id
                     )
                     if raw_detection.detected:
@@ -344,7 +344,7 @@ def run_stage12_motion_estimation() -> None:
                         "STAGE 12 - TARGET MOTION ESTIMATION\n"
                         f"Time: {simulation_time_s:.1f}/{STAGE12_DURATION_SECONDS:.1f}s | {status}\n"
                         f"Estimator: {estimate.status if estimate is not None else 'RESET'} | "
-                        "Prediction → display/log only; controller → current raw RGB",
+                        "Prediction 鈫?display/log only; controller 鈫?current raw RGB",
                         context.debug_text_id, client_id,
                     )
                 time.sleep(sim.TIME_STEP)
@@ -378,3 +378,4 @@ def run_stage12_motion_estimation() -> None:
             camera_display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

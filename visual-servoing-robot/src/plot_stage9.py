@@ -84,7 +84,7 @@ def _numeric(frame: pd.DataFrame, columns: Iterable[str], path: Path) -> pd.Data
     return checked
 
 
-def _load_trial(level: str, path: Path) -> pd.DataFrame:
+def load_trial(level: str, path: Path) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(f"Required Stage 9 log is missing: {path}")
     frame = _numeric(pd.read_csv(path), NUMERIC_TRIAL_COLUMNS, path)
@@ -114,7 +114,7 @@ def _load_trial(level: str, path: Path) -> pd.DataFrame:
     return frame
 
 
-def _load_summary() -> pd.DataFrame:
+def load_summary() -> pd.DataFrame:
     if not SUMMARY_PATH.is_file():
         raise FileNotFoundError(f"Required Stage 9 summary is missing: {SUMMARY_PATH}")
     summary = pd.read_csv(SUMMARY_PATH)
@@ -269,8 +269,8 @@ def _report(summary: pd.DataFrame, trials: dict[str, pd.DataFrame]) -> None:
 
 def main() -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
-    trials = {level: _load_trial(level, path) for level, path in TRIAL_PATHS.items()}
-    summary = _load_summary()
+    trials = {level: load_trial(level, path) for level, path in TRIAL_PATHS.items()}
+    summary = load_summary()
     figure_paths = [_plot_error_norm(trials)]
     figure_paths.extend(_plot_ex_ey(level, frame) for level, frame in trials.items())
     figure_paths.append(

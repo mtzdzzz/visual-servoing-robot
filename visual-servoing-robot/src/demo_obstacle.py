@@ -1,7 +1,7 @@
 """Stage 21 Demo 3: deterministic Stage 20 obstacle-aware execution."""
 
 from demo_config import DEMO_OBSTACLE_TITLE, OBSTACLE_DEMO_RANDOM_SEED
-from stage20_trajectory_execution import run_stage20_demo
+from obstacle_motion_runtime import run_stage20_demo
 
 
 def run_demo_obstacle(*, gui: bool = True, realtime: bool = True, keep_open: bool = True):
@@ -10,4 +10,3 @@ def run_demo_obstacle(*, gui: bool = True, realtime: bool = True, keep_open: boo
         seed=OBSTACLE_DEMO_RANDOM_SEED, mode_title=DEMO_OBSTACLE_TITLE,
         window_title=DEMO_OBSTACLE_TITLE,
     )
-

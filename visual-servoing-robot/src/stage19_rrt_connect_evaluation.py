@@ -1,4 +1,4 @@
-"""Stage 19: RRT-Connect planning using only Stage 17 visual occupancy.
+﻿"""Stage 19: RRT-Connect planning using only Stage 17 visual occupancy.
 
 This is a planning, validation, and visualization experiment.  The GUI Panda
 is deliberately held at a safe start configuration throughout; no direct or
@@ -20,9 +20,11 @@ from typing import Sequence
 import numpy as np
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as stage10
-import stage14_rgbd_evaluation as stage14
+import robotics_core as sim
+import config
+import visual_servo_runtime as runtime
+import scene_factory
+import obstacle_perception_runtime
 import stage17_obstacle_evaluation as stage17
 import stage18_collision_evaluation as stage18
 from camera_observation import EyeInHandRgbDisplay
@@ -40,11 +42,11 @@ SUMMARY_PATH = LOG_DIRECTORY / "stage19_summary.csv"
 # The Stage 18 validated interpolation density is deliberately reused without
 # relaxation.  The remaining values are fixed Stage 19 planner configuration,
 # not visual-servo or robot motor parameters.
-RRT_STEP_SIZE_RAD = 0.15
-PATH_MAX_JOINT_STEP_RAD = stage18.PATH_MAX_JOINT_STEP_RAD
-GOAL_BIAS_PROBABILITY = 0.10
-MAX_ITERATIONS = 2500
-MAX_PLANNING_TIME_S = 5.0
+RRT_STEP_SIZE_RAD = config.RRT_STEP_SIZE_RAD
+PATH_MAX_JOINT_STEP_RAD = config.COLLISION_INTERPOLATION_RESOLUTION_RAD
+GOAL_BIAS_PROBABILITY = config.RRT_GOAL_BIAS_PROBABILITY
+MAX_ITERATIONS = config.RRT_MAX_ITERATIONS
+MAX_PLANNING_TIME_S = config.RRT_MAX_PLANNING_TIME_S
 RRT_RANDOM_SEEDS = (1, 2, 3, 4, 5)
 
 # Stage 17's yellow geometry and safety margin are reused unchanged.  The
@@ -202,19 +204,19 @@ def _draw_waypoint_path(
         )
 
 
-def _set_stage19_current_start(context: stage10.ReadyContext, client_id: int) -> None:
+def _set_stage19_current_start(context: runtime.ReadyContext, client_id: int) -> None:
     """Set the static planning-start configuration, then HOLD it unchanged."""
 
     if len(context.active_joint_indices) != len(STAGE19_ACTIVE_START):
         raise RuntimeError("Stage 19 expected exactly the three Stage 3.1 active joints.")
     for joint_index, position in zip(context.active_joint_indices, STAGE19_ACTIVE_START):
         p.resetJointState(context.robot_id, joint_index, position, physicsClientId=client_id)
-    stage14._freeze_at_current_pose(context, client_id)
-    stage14._run_hold_steps(context, round(0.50 / sim.TIME_STEP), client_id)
-    stage14._freeze_at_current_pose(context, client_id)
+    scene_factory.freeze_at_current_pose(context, client_id)
+    scene_factory.run_hold_steps(context, round(0.50 / sim.TIME_STEP), client_id)
+    scene_factory.freeze_at_current_pose(context, client_id)
 
 
-def _full_current_configuration(context: stage10.ReadyContext, client_id: int) -> tuple[float, ...]:
+def _full_current_configuration(context: runtime.ReadyContext, client_id: int) -> tuple[float, ...]:
     return tuple(
         float(p.getJointState(context.robot_id, joint_index, physicsClientId=client_id)[0])
         for joint_index in context.arm_joint_indices
@@ -222,7 +224,7 @@ def _full_current_configuration(context: stage10.ReadyContext, client_id: int) -
 
 
 def _locked_vector_positions(
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     checker: CollisionChecker,
 ) -> tuple[dict[int, float], tuple[int, ...]]:
     """Map PyBullet indices to the seven-joint CollisionChecker vector order."""
@@ -242,7 +244,7 @@ def _locked_vector_positions(
 
 def _solve_goal_with_existing_ik(
     scenario: PlanningScenario,
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     client_id: int,
 ) -> tuple[tuple[float, ...], float]:
     """Use the existing constrained, position-only IK without motor commands."""
@@ -338,15 +340,15 @@ def run_stage19_rrt_connect_planning() -> None:
     checker: CollisionChecker | None = None
     try:
         display = EyeInHandRgbDisplay("Eye-in-Hand RGB-D - Stage 19 RRT-Connect")
-        context = stage14._create_static_localization_context(client_id)
+        context = scene_factory.create_static_localization_context(client_id)
         _set_stage19_current_start(context, client_id)
         target_ids = {"target_1": context.target_body_id}
         for spec in TARGET_SPECS[1:]:
             target_ids[spec.target_id] = _create_coloured_sphere(spec, client_id)
         for target_id, target_position in stage17.TARGET_WORLD_POSITIONS.items():
             _set_target_pose(target_ids[target_id], target_position, client_id)
-        obstacle_body_id = stage17._create_yellow_obstacle(client_id)
-        stage17._set_static_body_pose(obstacle_body_id, STAGE19_OBSTACLE_SCENE_POSITION, client_id)
+        obstacle_body_id = scene_factory.create_box_obstacle(stage17.OBSTACLE_DIMENSIONS_M, stage17.OBSTACLE_RGBA, client_id)
+        scene_factory.set_static_body_pose(obstacle_body_id, STAGE19_OBSTACLE_SCENE_POSITION, client_id)
         p.addUserDebugText(
             "REAL OBSTACLE (Stage 19 scene)",
             (
@@ -359,7 +361,7 @@ def run_stage19_rrt_connect_planning() -> None:
             "STAGE 19 - RRT-CONNECT PLANNING\nRobot: HOLD | Planning and visual validation only; no candidate path executes",
             context.debug_text_id, client_id,
         )
-        stage14._run_hold_steps(context, round(stage17.SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
+        scene_factory.run_hold_steps(context, round(stage17.SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
 
         print("Stage 19: RRT-Connect Collision-Free Path Planning")
         print("Planning joints: panda_joint5, panda_joint6, panda_joint7. Locked: panda_joint1--4.")
@@ -368,7 +370,11 @@ def run_stage19_rrt_connect_planning() -> None:
             f"goal bias={GOAL_BIAS_PROBABILITY:.0%} | max iterations={MAX_ITERATIONS} | max time={MAX_PLANNING_TIME_S:.1f}s."
         )
         print("Formal planner input: fresh Stage 17 visual occupancy AABB only. GT is evaluation-only after planning.")
-        visual_occupancy, _debug_box, captured_steps = stage18._capture_visual_occupancy(context, display, client_id)
+        visual_occupancy, _debug_box, captured_steps = obstacle_perception_runtime.capture_visual_occupancy(
+            context, display, client_id, stage17.OBSTACLE_DIMENSIONS_M,
+            stage17.OBSTACLE_SAFETY_MARGIN_M, stage18.VISUAL_OCCUPANCY_FRAMES,
+            stage17.MAX_CAPTURE_SECONDS,
+        )
         print(f"Stage 17 visual occupancy capture: {stage18.VISUAL_OCCUPANCY_FRAMES} valid frames / {captured_steps} physics steps.")
         print(f"Estimated occupancy: min={visual_occupancy.minimum}, max={visual_occupancy.maximum}")
 
@@ -546,3 +552,4 @@ def run_stage19_rrt_connect_planning() -> None:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

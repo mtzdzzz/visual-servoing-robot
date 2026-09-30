@@ -188,8 +188,8 @@ def _check_stage7_summary(stage7_trials: list[Stage7Trial], quality: list[str]) 
 
 def _load_stage9(quality: list[str]) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
     """Reuse Stage 9's strict formal-measurement loader and reconcile summary."""
-    trials = {level: stage9_plot._load_trial(level, path) for level, path in stage9_plot.TRIAL_PATHS.items()}
-    summary = stage9_plot._load_summary().copy()
+    trials = {level: stage9_plot.load_trial(level, path) for level, path in stage9_plot.TRIAL_PATHS.items()}
+    summary = stage9_plot.load_summary().copy()
     for level, frame in trials.items():
         metric = _metric(frame["error_norm"])
         row = summary.loc[level]
@@ -337,7 +337,7 @@ def _plot_stage10_lost(lost: pd.DataFrame, recorded_recovery_time_s: float) -> P
     time_values = lost["time_s"].to_numpy(dtype=float)
     errors = lost["error_norm"].to_numpy(dtype=float)
     detected = lost["target_detected"].astype(bool).to_numpy()
-    lost_intervals = stage10_plot._contiguous_false_intervals(time_values, detected)
+    lost_intervals = stage10_plot.contiguous_false_intervals(time_values, detected)
     reacquired = float(lost.loc[(lost["phase"] == "RECOVERY") & lost["target_detected"].eq(1), "time_s"].iloc[0])
     # The CSV stores each fresh RGB sample but not a separate "five-frame
     # precision verified" state. Use the Stage 10 summary's recorded recovery

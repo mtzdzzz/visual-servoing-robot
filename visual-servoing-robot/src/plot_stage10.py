@@ -48,7 +48,7 @@ def _quality_check(label: str, frame: pd.DataFrame, duration_seconds: float | No
         print("  WARNING: WARM-UP rows found in formal Stage 10 data.")
 
 
-def _contiguous_false_intervals(time_values: np.ndarray, detected: np.ndarray) -> list[tuple[float, float]]:
+def contiguous_false_intervals(time_values: np.ndarray, detected: np.ndarray) -> list[tuple[float, float]]:
     """Return spans where target_detected is false for readable shading."""
     intervals: list[tuple[float, float]] = []
     start: float | None = None
@@ -71,7 +71,7 @@ def plot_target_lost_recovery(frame: pd.DataFrame) -> Path:
     detected = pd.to_numeric(frame["target_detected"], errors="coerce").fillna(0).astype(bool).to_numpy()
     figure, axis = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
     axis.plot(time_values, errors, color="#1f77b4", linewidth=1.6, label="RGB tracking error norm")
-    for index, (start, end) in enumerate(_contiguous_false_intervals(time_values, detected)):
+    for index, (start, end) in enumerate(contiguous_false_intervals(time_values, detected)):
         axis.axvspan(start, end, color="#d62728", alpha=0.20, label="Target lost" if index == 0 else None)
     axis.axhline(2.0 * np.sqrt(2.0), linestyle="--", color="#2ca02c", linewidth=1.1,
                  label="2 px/axis precision bound")

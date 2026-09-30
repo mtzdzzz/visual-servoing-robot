@@ -1,4 +1,4 @@
-"""Stage 16 manual multi-target switching with frozen predictive visual servo.
+﻿"""Stage 16 manual multi-target switching with frozen predictive visual servo.
 
 The selected controller input originates solely from the selected target's RGB
 centroid.  Target world positions in this module create fixed coloured spheres
@@ -21,16 +21,18 @@ import numpy as np
 import pybullet as p
 import pybullet_data
 
-import simulation as sim
-import stage10_evaluation as stage10
-import stage13_evaluation as stage13
+import robotics_core as sim
+import config
+import visual_servo_runtime as runtime
+import predictive_measurement as predictive
 from camera_observation import EyeInHandRgbDisplay, RedTargetDetection
 from multi_target_detector import (
     DetectedTarget,
     MultiTargetDetector,
     annotate_multi_target_detections,
 )
-from stage15_multitarget_evaluation import TARGET_SPECS, _create_coloured_sphere, _set_target_pose
+from stage15_multitarget_evaluation import TARGET_SPECS
+import scene_factory
 from target_manager import TargetManager, TargetSwitchEvent
 
 
@@ -48,10 +50,10 @@ TARGET_WORLD_POSITIONS: dict[str, tuple[float, float, float]] = {
 }
 
 KEY_TO_TARGET_ID = {ord("1"): "target_1", ord("2"): "target_2", ord("3"): "target_3"}
-STAGE16_PREDICTION_ALPHA = stage13.PREDICTION_ALPHA
+STAGE16_PREDICTION_ALPHA = predictive.PREDICTION_ALPHA
 # This is the best Stage 13 online horizon already evaluated with the frozen
 # alpha.  Stage 16 does not tune it.
-STAGE16_PREDICTION_HORIZON_S = 0.30
+STAGE16_PREDICTION_HORIZON_S = config.PREDICTION_HORIZON_S
 AUTOMATED_EVALUATION_SWITCH_SEQUENCE: tuple[tuple[float, str], ...] = (
     (1.0, "target_2"),  # RED -> GREEN
     (10.0, "target_3"),  # GREEN -> BLUE
@@ -213,7 +215,7 @@ def _write_log_row(
     estimate: object | None,
     source: str,
     switch_event: TargetSwitchEvent | None,
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     ik_command_issued: bool,
     prediction_clamped: bool,
 ) -> dict[str, object]:
@@ -387,7 +389,7 @@ def _create_multitarget_ready_context(
     mode_title: str,
     realtime: bool = True,
     perform_warmup: bool = True,
-) -> tuple[stage10.ReadyContext, dict[str, int]]:
+) -> tuple[runtime.ReadyContext, dict[str, int]]:
     """Create all Stage 16 targets before a RED-only WARM-UP.
 
     This deliberately does not call Stage 10's single-red ready helper. The
@@ -413,16 +415,16 @@ def _create_multitarget_ready_context(
 
     # Three static target bodies are created before entering the WARM-UP loop.
     target_body_ids = {
-        spec.target_id: _create_coloured_sphere(spec, client_id)
+        spec.target_id: scene_factory.create_coloured_sphere(sim.GROUND_TARGET_RADIUS, spec.rgba, client_id)
         for spec in TARGET_SPECS
     }
     for target_id, position in TARGET_WORLD_POSITIONS.items():
-        _set_target_pose(target_body_ids[target_id], position, client_id)
+        scene_factory.set_static_body_pose(target_body_ids[target_id], position, client_id)
 
     axis_ids: list[int] = []
     sim.update_camera_reference_axes(robot_id, client_id, axis_ids)
     active_hold = sim.capture_active_joint_hold_targets(robot_id, active_indices, client_id)
-    context = stage10.ReadyContext(
+    context = runtime.ReadyContext(
         robot_id=robot_id,
         target_body_id=target_body_ids["target_1"],
         arm_joint_indices=arm_joint_indices,
@@ -454,7 +456,7 @@ def _create_multitarget_ready_context(
         return context, target_body_ids
 
     for step in range(warmup_steps):
-        stage10._step_physics(context, client_id)
+        runtime.step_physics(context, client_id)
         if step % sim.CAMERA_UPDATE_INTERVAL_STEPS != 0:
             if realtime:
                 time.sleep(sim.TIME_STEP)
@@ -471,10 +473,10 @@ def _create_multitarget_ready_context(
         estimate = estimates[manager.selected_target_id]
         source = manager.controller_source_for_selected(estimate)
         if source == "PREDICTED":
-            controller_measurement, source, _ = stage13._predicted_measurement(raw_measurement, estimate)
+            controller_measurement, source, _ = predictive.predicted_measurement(raw_measurement, estimate)
         else:
             controller_measurement = raw_measurement
-        stage10._control_latest_measurement(context, controller_measurement, client_id)
+        runtime.control_latest_measurement(context, controller_measurement, client_id)
 
         if raw_measurement.detected:
             assert raw_measurement.pixel_error is not None
@@ -570,7 +572,7 @@ def run_stage16_target_selection() -> None:
 
             # Frozen Stage 13/10 motor path. The current hold target remains
             # in force when the selected target is centred or currently lost.
-            stage10._step_physics(context, client_id)
+            runtime.step_physics(context, client_id)
             if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                 sim.update_camera_reference_axes(
                     context.robot_id, client_id, context.camera_axis_debug_item_ids
@@ -592,7 +594,7 @@ def run_stage16_target_selection() -> None:
                 source = manager.controller_source_for_selected(estimate)
                 prediction_clamped = False
                 if source == "PREDICTED":
-                    controller_measurement, source, prediction_clamped = stage13._predicted_measurement(
+                    controller_measurement, source, prediction_clamped = predictive.predicted_measurement(
                         raw_measurement, estimate
                     )
                 else:
@@ -601,7 +603,7 @@ def run_stage16_target_selection() -> None:
                 # The controller receives the selected target only. If that
                 # target is absent, the frozen controller requests HOLD; it
                 # cannot select another visible colour.
-                stage10._control_latest_measurement(context, controller_measurement, client_id)
+                runtime.control_latest_measurement(context, controller_measurement, client_id)
                 display.show(
                     frame,
                     _annotated_overlay(
@@ -677,7 +679,7 @@ def run_stage16_evaluation() -> None:
 
                 # Frozen Stage 13/10 motor path: keep locks and currently
                 # commanded active targets at every physics step.
-                stage10._step_physics(context, client_id)
+                runtime.step_physics(context, client_id)
                 metrics.max_locked_deviation = max(metrics.max_locked_deviation, context.max_locked_deviation)
 
                 if step % sim.CAMERA_UPDATE_INTERVAL_STEPS != 0:
@@ -696,7 +698,7 @@ def run_stage16_evaluation() -> None:
                 source = manager.controller_source_for_selected(estimate)
                 prediction_clamped = False
                 if source == "PREDICTED":
-                    controller_measurement, source, prediction_clamped = stage13._predicted_measurement(
+                    controller_measurement, source, prediction_clamped = predictive.predicted_measurement(
                         raw_measurement, estimate
                     )
                 else:
@@ -705,7 +707,7 @@ def run_stage16_evaluation() -> None:
                 # This is the sole controller call.  ``controller_measurement``
                 # originates from the selected target only; other detections
                 # remain display/estimator observations.
-                ik_command_issued, _ = stage10._control_latest_measurement(
+                ik_command_issued, _ = runtime.control_latest_measurement(
                     context, controller_measurement, client_id
                 )
 
@@ -785,3 +787,5 @@ def run_stage16_evaluation() -> None:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+
+

@@ -1,4 +1,4 @@
-"""Stage 13 online A/B evaluation: current-centroid vs predicted-centroid servo.
+﻿"""Stage 13 online A/B evaluation: current-centroid vs predicted-centroid servo.
 
 The only controller-input difference between the two modes is the RGB
 centroid supplied to the frozen Stage 9 latest-observation command function.
@@ -16,19 +16,21 @@ from typing import Literal, Sequence
 
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as stage10
+import robotics_core as sim
+import visual_servo_runtime as runtime
 from camera_observation import EyeInHandRgbDisplay, RedTargetDetection
 from target_motion_estimator import MotionEstimate, TargetMotionEstimator
+from predictive_measurement import (
+    PREDICTION_ALPHA, PREDICTION_OFFSET_CLAMP_PIXELS, predicted_measurement,
+)
+
+# Backward-compatible experiment alias; implementation lives in the core adapter.
+_predicted_measurement = predicted_measurement
 
 
 LOG_DIRECTORY = Path(__file__).resolve().parents[1] / "outputs" / "logs"
 STAGE13_DURATION_SECONDS = sim.STAGE9_DURATION_SECONDS
-PREDICTION_ALPHA = 0.20
 PREDICTION_HORIZONS_S = (0.15, 0.20, 0.30)
-# Fixed before every A/B trial. It is a prediction safety limit, not a
-# controller gain and is never adapted from a trial result.
-PREDICTION_OFFSET_CLAMP_PIXELS = 12.0
 TRAJECTORIES: tuple[tuple[str, float], ...] = (("MEDIUM", 0.10), ("FAST", 0.20))
 
 ControllerMode = Literal["BASELINE", "PREDICTIVE"]
@@ -65,7 +67,7 @@ def _metric(values: Sequence[float]) -> dict[str, float | None]:
 
 
 def _capture_raw_detection(
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     client_id: int,
     camera_display: EyeInHandRgbDisplay,
     overlay_text: str,
@@ -81,46 +83,6 @@ def _capture_raw_detection(
     return raw_detection
 
 
-def _predicted_measurement(
-    raw_detection: RedTargetDetection,
-    estimate: MotionEstimate | None,
-) -> tuple[RedTargetDetection, str, bool]:
-    """Create the controller measurement from vision-only prediction.
-
-    The returned detection is the same type used by the frozen controller.
-    It contains no object id or world-coordinate information.  Before the
-    estimator has two valid frames, the raw current detection is used.
-    """
-
-    if not raw_detection.detected:
-        return raw_detection, "TARGET_LOST", False
-    if estimate is None or not estimate.estimator_valid:
-        return raw_detection, "CURRENT_FALLBACK", False
-
-    assert raw_detection.centroid is not None
-    u_raw, v_raw = raw_detection.centroid
-    offset_u = estimate.u_pred - u_raw
-    offset_v = estimate.v_pred - v_raw
-    limited_u = max(-PREDICTION_OFFSET_CLAMP_PIXELS, min(PREDICTION_OFFSET_CLAMP_PIXELS, offset_u))
-    limited_v = max(-PREDICTION_OFFSET_CLAMP_PIXELS, min(PREDICTION_OFFSET_CLAMP_PIXELS, offset_v))
-    clamped = abs(limited_u - offset_u) > 1e-12 or abs(limited_v - offset_v) > 1e-12
-    controller_centroid = (u_raw + limited_u, v_raw + limited_v)
-    center_x, center_y = raw_detection.image_center
-    return (
-        RedTargetDetection(
-            detected=True,
-            bounding_box=raw_detection.bounding_box,
-            contour_area=raw_detection.contour_area,
-            centroid=controller_centroid,
-            image_center=raw_detection.image_center,
-            pixel_error=(controller_centroid[0] - center_x, controller_centroid[1] - center_y),
-            annotated_rgba_buffer=raw_detection.annotated_rgba_buffer,
-        ),
-        "PREDICTED_CLAMPED" if clamped else "PREDICTED",
-        clamped,
-    )
-
-
 def _log_row(
     simulation_time_s: float,
     speed_level: str,
@@ -132,7 +94,7 @@ def _log_row(
     controller_measurement: RedTargetDetection,
     measurement_source: str,
     prediction_clamped: bool,
-    context: stage10.ReadyContext,
+    context: runtime.ReadyContext,
     ik_command_issued: bool,
     nonzero_correction_issued: bool,
 ) -> dict[str, object]:
@@ -211,7 +173,7 @@ def _run_trial(
     label = f"STAGE 13 {mode} {speed_level}" + (f" tau={horizon_s:.2f}" if horizon_s else "")
     # Warm-up always uses the existing raw-baseline controller, making the
     # dynamic t=0 robot state comparable for all A/B trials.
-    context = stage10._create_ready_context(client_id, camera_display, label)
+    context = runtime.create_ready_context(client_id, camera_display, label)
     log_path = _trial_filename(mode, horizon_s, speed_level)
     estimator = (
         TargetMotionEstimator(PREDICTION_ALPHA, float(horizon_s))
@@ -242,7 +204,7 @@ def _run_trial(
                 angularVelocity=(0.0, 0.0, 0.0),
                 physicsClientId=client_id,
             )
-            stage10._step_physics(context, client_id)
+            runtime.step_physics(context, client_id)
             if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                 sim.update_camera_reference_axes(
                     context.robot_id, client_id, context.camera_axis_debug_item_ids
@@ -278,7 +240,7 @@ def _run_trial(
                     target_lost_count += 1
                 was_detected = raw_detection.detected
                 servo_decisions += 1
-                ik_command_issued, nonzero_correction_issued = stage10._control_latest_measurement(
+                ik_command_issued, nonzero_correction_issued = runtime.control_latest_measurement(
                     context, controller_measurement, client_id
                 )
                 ik_commands += int(ik_command_issued)
@@ -373,7 +335,7 @@ def run_stage13_predictive_visual_servo_evaluation() -> None:
         print("Frozen controller/camera/IK/joint baseline; only current vs predicted centroid differs.")
         print(
             f"Predictor: alpha={PREDICTION_ALPHA:.2f}; horizons={PREDICTION_HORIZONS_S}; "
-            f"fixed per-axis prediction clamp=±{PREDICTION_OFFSET_CLAMP_PIXELS:.1f}px."
+            f"fixed per-axis prediction clamp=卤{PREDICTION_OFFSET_CLAMP_PIXELS:.1f}px."
         )
         print("All final tracking metrics use raw OpenCV RGB centroid error.")
         summaries: list[dict[str, object]] = []
@@ -396,3 +358,4 @@ def run_stage13_predictive_visual_servo_evaluation() -> None:
             camera_display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

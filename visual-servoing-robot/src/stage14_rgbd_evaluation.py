@@ -1,4 +1,4 @@
-"""Stage 14 static RGB-D target localization experiment.
+﻿"""Stage 14 static RGB-D target localization experiment.
 
 The Panda visual-servo controller is deliberately not modified here.  The
 module starts from a previously validated static, camera-visible Panda hold
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from math import acos, degrees, sqrt
+from math import acos, degrees
 from pathlib import Path
 import time
 from typing import Sequence
@@ -20,10 +20,11 @@ from typing import Sequence
 import cv2
 import numpy as np
 import pybullet as p
-import pybullet_data
 
-import simulation as sim
-import stage10_evaluation as stage10
+import robotics_core as sim
+import visual_servo_runtime as runtime
+import camera_geometry
+import scene_factory
 from camera_observation import (
     CAMERA_FAR_PLANE,
     CAMERA_FOV_Y_DEGREES,
@@ -31,7 +32,6 @@ from camera_observation import (
     EyeInHandRgbDisplay,
     LiveCameraFrame,
     RedTargetDetection,
-    create_manual_draggable_red_ground_target,
     detect_red_target_from_live_rgb,
     render_live_eye_in_hand_rgbd_frame,
 )
@@ -102,54 +102,6 @@ class EstimatedTargetDebugMarker:
         )
 
 
-def _matrix_from_pose(position: Sequence[float], orientation: Sequence[float]) -> np.ndarray:
-    """Return homogeneous transform for the supplied PyBullet pose."""
-
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = np.asarray(p.getMatrixFromQuaternion(orientation), dtype=np.float64).reshape(3, 3)
-    transform[:3, 3] = np.asarray(position, dtype=np.float64)
-    return transform
-
-
-def _compose_camera_to_world(robot_id: int, client_id: int) -> tuple[np.ndarray, list[float], list[float]]:
-    """Compose T_W_C = T_W_E @ T_E_C without any target input."""
-
-    end_position, end_orientation = sim.get_end_effector_reference_pose(robot_id, client_id)
-    camera_position, camera_orientation = p.multiplyTransforms(
-        end_position,
-        end_orientation,
-        sim.T_E_C_POSITION,
-        sim.T_E_C_ORIENTATION,
-    )
-    return _matrix_from_pose(camera_position, camera_orientation), list(camera_position), list(camera_orientation)
-
-
-def _quaternion_angle_degrees(first: Sequence[float], second: Sequence[float]) -> float:
-    dot = abs(sum(a * b for a, b in zip(first, second)))
-    return degrees(2.0 * acos(min(1.0, max(-1.0, dot))))
-
-
-def _validate_camera_pose_and_render_frame(
-    robot_id: int,
-    live_frame: LiveCameraFrame,
-    client_id: int,
-) -> tuple[np.ndarray, float, float]:
-    """Audit T_W_C composition and render axes before localizing any target."""
-
-    camera_to_world, composed_position, composed_orientation = _compose_camera_to_world(robot_id, client_id)
-    position_error = float(
-        np.linalg.norm(np.asarray(composed_position) - np.asarray(live_frame.camera_world_position))
-    )
-    orientation_error = _quaternion_angle_degrees(
-        composed_orientation, live_frame.camera_world_orientation
-    )
-    if position_error > 1e-6 or orientation_error > 1e-3:
-        raise RuntimeError(
-            "Stage 14 camera-pose audit failed: live render pose is not T_W_E @ T_E_C."
-        )
-    return camera_to_world, position_error, orientation_error
-
-
 def _ground_truth_projection_diagnostic(
     camera_to_world: np.ndarray,
     render_to_camera: np.ndarray,
@@ -178,36 +130,6 @@ def _ground_truth_projection_diagnostic(
         f"P_C=[{gt_camera[0]:+.4f}, {gt_camera[1]:+.4f}, {gt_camera[2]:+.4f}] m, "
         f"pixel=({expected_u:.1f}, {expected_v:.1f}), render/C +Z angle={axis_error:.5f} deg."
     )
-
-
-def _normalize(vector: np.ndarray) -> np.ndarray:
-    length = float(np.linalg.norm(vector))
-    if length <= 1e-12:
-        raise RuntimeError("Camera render frame contains a zero-length axis.")
-    return vector / length
-
-
-def _render_to_camera_axis_transform(
-    camera_to_world: np.ndarray,
-    live_frame: LiveCameraFrame,
-) -> np.ndarray:
-    """Derive C_render -> physical C from exact view target/up vectors.
-
-    PyBullet's view frame is made from ``right = forward x up``.  It has
-    image-right/image-up/forward axes and may differ from the hand-eye pose's
-    local axes.  Computing this matrix from the same render parameters avoids
-    guessing a sign or mixing OpenGL and robotics frame conventions.
-    """
-
-    eye = np.asarray(live_frame.render_parameters.eye_position, dtype=np.float64)
-    target = np.asarray(live_frame.render_parameters.target_position, dtype=np.float64)
-    forward = _normalize(target - eye)
-    up_input = _normalize(np.asarray(live_frame.render_parameters.up_vector, dtype=np.float64))
-    render_right = _normalize(np.cross(forward, up_input))
-    render_up = _normalize(np.cross(render_right, forward))
-    render_to_world = np.column_stack((render_right, render_up, forward))
-    camera_to_world_rotation = camera_to_world[:3, :3]
-    return camera_to_world_rotation.T @ render_to_world
 
 
 def _overlay_rgbd_localization(
@@ -436,86 +358,6 @@ def _set_static_target(target_body_id: int, world_position: Sequence[float], cli
     )
 
 
-def _run_hold_steps(context: stage10.ReadyContext, number_of_steps: int, client_id: int) -> None:
-    for step in range(number_of_steps):
-        stage10._step_physics(context, client_id)
-        if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
-            sim.update_camera_reference_axes(
-                context.robot_id, client_id, context.camera_axis_debug_item_ids
-            )
-        time.sleep(sim.TIME_STEP)
-
-
-def _freeze_at_current_pose(context: stage10.ReadyContext, client_id: int) -> None:
-    """Make the reached active pose a hold target; no subsequent servo command occurs."""
-
-    context.active_hold_targets = sim.capture_active_joint_hold_targets(
-        context.robot_id, context.active_joint_indices, client_id
-    )
-    context.commanded_joint_targets = sim.build_hold_joint_targets(
-        context.arm_joint_indices, context.locked_initial_positions, context.active_hold_targets
-    )
-
-
-def _create_static_localization_context(
-    client_id: int,
-) -> stage10.ReadyContext:
-    """Build a known safe, camera-visible HOLD state without a control warm-up.
-
-    Stage 14 evaluates perception only.  Reusing Stage 9's full READY
-    procedure caused it to execute the frozen visual-servo controller for a
-    long time before the first RGB-D sample.  Instead, this initialization
-    selects the already validated Stage 7 ``upper_left`` active-joint pose,
-    captures it as the hold target, then issues only the established
-    constrained POSITION_CONTROL command on every physics step.  No RGB
-    measurement, target world position, or localization output is used to
-    command the robot here.
-    """
-
-    p.resetSimulation(physicsClientId=client_id)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
-    p.setGravity(0, 0, 0, physicsClientId=client_id)
-    p.setTimeStep(sim.TIME_STEP, physicsClientId=client_id)
-    sim.enable_pybullet_camera_debug_previews(client_id)
-    p.loadURDF("plane.urdf", physicsClientId=client_id)
-    robot_id = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True, physicsClientId=client_id)
-    initial_positions = sim.print_panda_arm_joint_configuration(robot_id, client_id)
-    arm_joint_indices = sim.get_panda_arm_joint_indices(robot_id, client_id)
-    arm_joint_names = sim.get_panda_arm_joint_names(robot_id, client_id)
-    locked_indices = [arm_joint_names[name] for name in sim.BASELINE_LOCKED_JOINT_NAMES]
-    locked_positions = {index: initial_positions[index] for index in locked_indices}
-    active_indices = [index for index in arm_joint_indices if index not in locked_indices]
-    _, active_start_positions = sim.STAGE7_TRIAL_ACTIVE_START_POSITIONS[0]
-    for joint_index, target_position in zip(active_indices, active_start_positions):
-        p.resetJointState(robot_id, joint_index, target_position, physicsClientId=client_id)
-    target_body_id = create_manual_draggable_red_ground_target(client_id)
-    _set_static_target(target_body_id, sim.STAGE9_TARGET_CENTER_WORLD, client_id)
-    active_hold = sim.capture_active_joint_hold_targets(robot_id, active_indices, client_id)
-    commanded = sim.build_hold_joint_targets(arm_joint_indices, locked_positions, active_hold)
-    context = stage10.ReadyContext(
-        robot_id=robot_id,
-        target_body_id=target_body_id,
-        arm_joint_indices=arm_joint_indices,
-        active_joint_indices=active_indices,
-        locked_joint_indices=locked_indices,
-        locked_initial_positions=locked_positions,
-        commanded_joint_targets=commanded,
-        active_hold_targets=active_hold,
-        servo=sim.TwoDimensionalVisualServo(),
-        camera_axis_debug_item_ids=[],
-        debug_text_id=None,
-        warmup_duration_s=0.0,
-        warmup_initial_error=None,
-        ready_ex=None,
-        ready_ey=None,
-        max_locked_deviation=0.0,
-    )
-    _run_hold_steps(context, round(1.0 / sim.TIME_STEP), client_id)
-    _freeze_at_current_pose(context, client_id)
-    sim.update_camera_reference_axes(robot_id, client_id, context.camera_axis_debug_item_ids)
-    return context
-
-
 def run_stage14_rgbd_localization() -> None:
     """Run five static, vision-only RGB-D localization trials in the GUI."""
 
@@ -528,7 +370,7 @@ def run_stage14_rgbd_localization() -> None:
         display = EyeInHandRgbDisplay("Eye-in-Hand RGB-D - Stage 14")
         print("Stage 14: RGB-D Target 3D Localization")
         print("Controller and predictor are frozen; this mode sends no localization result to IK.")
-        context = _create_static_localization_context(client_id)
+        context = scene_factory.create_static_localization_context(client_id)
         print("Stage 14 initialization: validated Stage 7 safe active pose -> HOLD (no visual-servo warm-up).")
         intrinsics = camera_intrinsics_from_fov(640, 480, CAMERA_FOV_Y_DEGREES)
         localizer = RGBDTargetLocalizer(
@@ -561,7 +403,7 @@ def run_stage14_rgbd_localization() -> None:
             writer.writeheader()
             for trial_index, (label, scheduled_position) in enumerate(STATIC_TARGET_POSITIONS, start=1):
                 _set_static_target(context.target_body_id, scheduled_position, client_id)
-                _run_hold_steps(context, round(SETTLE_SECONDS / sim.TIME_STEP), client_id)
+                scene_factory.run_hold_steps(context, round(SETTLE_SECONDS / sim.TIME_STEP), client_id)
                 simulation_time_s += SETTLE_SECONDS
                 collected: list[RGBDLocalizationResult] = []
                 capture_steps = 0
@@ -573,7 +415,7 @@ def run_stage14_rgbd_localization() -> None:
                     client_id,
                 )
                 while len(collected) < SAMPLES_PER_STATIC_POSITION and capture_steps < maximum_steps:
-                    stage10._step_physics(context, client_id)
+                    runtime.step_physics(context, client_id)
                     simulation_time_s += sim.TIME_STEP
                     if capture_steps % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                         sim.update_camera_reference_axes(
@@ -587,7 +429,7 @@ def run_stage14_rgbd_localization() -> None:
                         )
                         live_frame = rgbd_frame.live_rgb_frame
                         detection = detect_red_target_from_live_rgb(live_frame)
-                        camera_to_world, pose_error, rotation_error = _validate_camera_pose_and_render_frame(
+                        camera_to_world, pose_error, rotation_error = camera_geometry.validate_camera_pose_and_render_frame(
                             context.robot_id, live_frame, client_id
                         )
                         if not camera_pose_audited:
@@ -596,7 +438,7 @@ def run_stage14_rgbd_localization() -> None:
                                 f"orientation error={rotation_error:.3e} deg."
                             )
                             camera_pose_audited = True
-                        current_render_axis_transform = _render_to_camera_axis_transform(
+                        current_render_axis_transform = camera_geometry.render_to_camera_axis_transform(
                             camera_to_world, live_frame
                         )
                         if render_axis_transform is None:
@@ -706,3 +548,4 @@ def run_stage14_rgbd_localization() -> None:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

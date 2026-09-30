@@ -1,14 +1,14 @@
-"""Stage 21 Demo 2: frozen Stage 16 manual multi-target integration."""
+﻿"""Stage 21 Demo 2: frozen Stage 16 manual multi-target integration."""
 
 from __future__ import annotations
 
 import time
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as stage10
-import stage13_evaluation as stage13
-import stage16_target_switching as stage16
+import robotics_core as sim
+import visual_servo_runtime as runtime
+import predictive_measurement as predictive
+import target_selection_runtime as selection
 from camera_observation import EyeInHandRgbDisplay
 from demo_config import DEMO_MULTITARGET_TITLE, DEFAULT_SELECTED_TARGET_ID
 from multi_target_detector import MultiTargetDetector
@@ -28,7 +28,7 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
         raise RuntimeError("Unable to connect to PyBullet for Demo 2.")
     display = EyeInHandRgbDisplay(DEMO_MULTITARGET_TITLE) if gui else _NullDisplay()
     manager = TargetManager(
-        stage16.STAGE16_PREDICTION_ALPHA, stage16.STAGE16_PREDICTION_HORIZON_S,
+        selection.PREDICTION_ALPHA, selection.PREDICTION_HORIZON_S,
         initial_target_id=DEFAULT_SELECTED_TARGET_ID,
     )
     detector = MultiTargetDetector()
@@ -38,8 +38,9 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
     available: list[str] = []
     context = None
     try:
-        context, _ = stage16._create_multitarget_ready_context(
+        context, _ = selection.create_multitarget_ready_context(
             client_id, display, detector, manager, DEMO_MULTITARGET_TITLE,
+            selection.DEFAULT_TARGET_SPECS, selection.DEFAULT_TARGET_WORLD_POSITIONS,
             realtime=realtime, perform_warmup=False,
         )
         print(f"{DEMO_MULTITARGET_TITLE}: ACTIVE")
@@ -47,12 +48,12 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
         while p.isConnected(client_id) and display.is_open:
             timestamp = step * sim.TIME_STEP
             if gui:
-                event, quit_requested = stage16._manual_keyboard_input(manager, timestamp, client_id)
+                event, quit_requested = selection.manual_keyboard_input(manager, timestamp, client_id)
                 if quit_requested:
                     break
                 if event is not None:
                     print(f"Manual selection: {event.previous_class} -> {event.selected_class}")
-            stage10._step_physics(context, client_id)
+            runtime.step_physics(context, client_id)
             if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                 sim.update_camera_reference_axes(context.robot_id, client_id, context.camera_axis_debug_item_ids)
                 camera_position, camera_orientation = sim.get_camera_optical_center_pose(context.robot_id, client_id)
@@ -60,7 +61,7 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
                 detections = detector.detect(frame.rgba_buffer, frame.image_width, frame.image_height)
                 available = sorted(detection.class_name for detection in detections if detection.valid)
                 estimates = manager.update_detections(timestamp, detections)
-                raw = stage16._controller_detection_from_selected(
+                raw = selection.controller_detection_from_selected(
                     manager.selected_detection(), (frame.image_width // 2, frame.image_height // 2),
                     frame.rgba_buffer,
                 )
@@ -68,10 +69,10 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
                 source = manager.controller_source_for_selected(estimate)
                 measurement = raw
                 if source == "PREDICTED":
-                    measurement, source, _ = stage13._predicted_measurement(raw, estimate)
-                stage10._control_latest_measurement(context, measurement, client_id)
+                    measurement, source, _ = predictive.predicted_measurement(raw, estimate)
+                runtime.control_latest_measurement(context, measurement, client_id)
                 raw_error = raw.pixel_error if raw.detected else None
-                display.show(frame, stage16._annotated_overlay(
+                display.show(frame, selection.annotated_overlay(
                     frame.rgba_buffer, frame.image_width, frame.image_height, detections,
                     manager, DEMO_MULTITARGET_TITLE, "MANUAL / TRACKING", source,
                     context.servo.state if raw.detected else "TARGET LOST / HOLD",
@@ -109,3 +110,5 @@ def run_demo_multitarget(*, gui: bool = True, realtime: bool = True, max_frames:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+
+

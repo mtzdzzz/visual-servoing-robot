@@ -6,11 +6,12 @@ Safety failures latch; neither a restart nor a return-home command exists here.
 from __future__ import annotations
 
 import numpy as np
+import config
 
-EXECUTION_RESOLUTION_RAD = 0.01
-COMMAND_SPEED_RAD_S = 0.04
-WAYPOINT_TOLERANCE_RAD = 0.0005
-WAYPOINT_TIMEOUT_S = 5.0
+EXECUTION_RESOLUTION_RAD = config.EXECUTION_RESOLUTION_RAD
+COMMAND_SPEED_RAD_S = config.COMMAND_SPEED_RAD_S
+WAYPOINT_TOLERANCE_RAD = config.WAYPOINT_TOLERANCE_RAD
+WAYPOINT_TIMEOUT_S = config.WAYPOINT_TIMEOUT_S
 
 
 def densify_path(path, resolution=EXECUTION_RESOLUTION_RAD):

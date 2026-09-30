@@ -1,4 +1,4 @@
-"""Stage 17 RGB-D obstacle perception and conservative occupancy evaluation.
+﻿"""Stage 17 RGB-D obstacle perception and conservative occupancy evaluation.
 
 No controller command, collision check, motion planner, or obstacle avoidance
 logic is used here.  The Panda remains in the frozen Stage 14 HOLD pose while
@@ -17,9 +17,11 @@ import cv2
 import numpy as np
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as stage10
-import stage14_rgbd_evaluation as stage14
+import robotics_core as sim
+import config
+import visual_servo_runtime as runtime
+import camera_geometry
+import scene_factory
 from camera_observation import (
     CAMERA_FAR_PLANE,
     CAMERA_FOV_Y_DEGREES,
@@ -32,7 +34,7 @@ from multi_target_detector import MultiTargetDetector, annotate_multi_target_det
 from obstacle_detector import ObstacleDetection, YellowObstacleDetector
 from obstacle_localization import ObstacleLocalizationResult, ObstacleLocalizer
 from rgbd_localization import camera_intrinsics_from_fov
-from stage15_multitarget_evaluation import TARGET_SPECS, _create_coloured_sphere, _set_target_pose
+from stage15_multitarget_evaluation import TARGET_SPECS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +43,9 @@ LOG_PATH = LOG_DIRECTORY / "stage17_obstacle_perception.csv"
 SUMMARY_PATH = LOG_DIRECTORY / "stage17_summary.csv"
 
 # Known shape only: its pose is *not* passed to detector/localizer/occupancy.
-OBSTACLE_DIMENSIONS_M = (0.10, 0.10, 0.16)  # world X, Y, Z; axis-aligned box
-OBSTACLE_SAFETY_MARGIN_M = 0.020
-OBSTACLE_RGBA = (1.0, 0.82, 0.0, 1.0)
+OBSTACLE_DIMENSIONS_M = config.OBSTACLE_DIMENSIONS_M
+OBSTACLE_SAFETY_MARGIN_M = config.OBSTACLE_SAFETY_MARGIN_M
+OBSTACLE_RGBA = config.OBSTACLE_RGBA
 SAMPLES_PER_SCENE = 20
 SCENE_SETTLE_SECONDS = 0.50
 MAX_CAPTURE_SECONDS = 8.0
@@ -313,17 +315,19 @@ def run_stage17_obstacle_perception() -> None:
             writer = csv.DictWriter(log_file, fieldnames=_csv_fields())
             writer.writeheader()
             for scene_index, (scene, obstacle_position) in enumerate(OBSTACLE_SCENES, start=1):
-                context = stage14._create_static_localization_context(client_id)
+                context = scene_factory.create_static_localization_context(client_id)
                 targets = {"target_1": context.target_body_id}
                 for spec in TARGET_SPECS[1:]:
-                    targets[spec.target_id] = _create_coloured_sphere(spec, client_id)
+                    targets[spec.target_id] = scene_factory.create_coloured_sphere(
+                        sim.GROUND_TARGET_RADIUS, spec.rgba, client_id
+                    )
                 for target_id, target_position in TARGET_WORLD_POSITIONS.items():
-                    _set_target_pose(targets[target_id], target_position, client_id)
+                    scene_factory.set_static_body_pose(targets[target_id], target_position, client_id)
                 obstacle_body_id = _create_yellow_obstacle(client_id)
                 _set_static_body_pose(obstacle_body_id, obstacle_position, client_id)
                 p.addUserDebugText("REAL OBSTACLE", [obstacle_position[0], obstacle_position[1], obstacle_position[2] + 0.11], textColorRGB=(1.0, 0.85, 0.0), textSize=1.0, physicsClientId=client_id)
                 debug_box = OccupancyDebugBox(client_id, [])
-                stage14._run_hold_steps(context, round(SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
+                scene_factory.run_hold_steps(context, round(SCENE_SETTLE_SECONDS / sim.TIME_STEP), client_id)
                 simulation_time += SCENE_SETTLE_SECONDS
                 context.debug_text_id = sim.update_motion_debug_text(
                     f"STAGE 17 - RGB-D OBSTACLE PERCEPTION\nScene {scene_index}/5: {scene}\nRobot: HOLD | GT: EVALUATION ONLY",
@@ -336,7 +340,7 @@ def run_stage17_obstacle_perception() -> None:
                 volume_ratios: list[float] = []
                 capture_steps = 0
                 while valid_count < SAMPLES_PER_SCENE and capture_steps < round(MAX_CAPTURE_SECONDS / sim.TIME_STEP):
-                    stage10._step_physics(context, client_id)
+                    runtime.step_physics(context, client_id)
                     simulation_time += sim.TIME_STEP
                     if capture_steps % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                         sim.update_camera_reference_axes(context.robot_id, client_id, context.camera_axis_debug_item_ids)
@@ -345,8 +349,8 @@ def run_stage17_obstacle_perception() -> None:
                         frame = rgbd.live_rgb_frame
                         targets_rgb = target_detector.detect(frame.rgba_buffer, frame.image_width, frame.image_height)
                         obstacle_rgb = obstacle_detector.detect(frame.rgba_buffer, frame.image_width, frame.image_height)
-                        camera_to_world, _, _ = stage14._validate_camera_pose_and_render_frame(context.robot_id, frame, client_id)
-                        current_axes = stage14._render_to_camera_axis_transform(camera_to_world, frame)
+                        camera_to_world, _, _ = camera_geometry.validate_camera_pose_and_render_frame(context.robot_id, frame, client_id)
+                        current_axes = camera_geometry.render_to_camera_axis_transform(camera_to_world, frame)
                         if fixed_render_to_camera is None:
                             fixed_render_to_camera = current_axes
                             print("Validated C_render -> C axis transform:\n" + np.array2string(current_axes, precision=5, suppress_small=True))
@@ -426,3 +430,4 @@ def run_stage17_obstacle_perception() -> None:
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+

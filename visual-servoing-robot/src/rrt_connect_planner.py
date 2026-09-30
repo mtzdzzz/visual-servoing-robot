@@ -21,6 +21,8 @@ from typing import Sequence
 
 import numpy as np
 
+import config
+
 from collision_checker import AxisAlignedBox, CollisionChecker
 
 
@@ -36,11 +38,11 @@ class ExtendStatus(str, Enum):
 class RRTConnectConfig:
     """Fixed, reproducible Stage 19 sampling parameters."""
 
-    step_size_rad: float = 0.15
-    edge_resolution_rad: float = 0.05
-    goal_bias_probability: float = 0.10
-    max_iterations: int = 2500
-    max_planning_time_s: float = 5.0
+    step_size_rad: float = config.RRT_STEP_SIZE_RAD
+    edge_resolution_rad: float = config.COLLISION_INTERPOLATION_RESOLUTION_RAD
+    goal_bias_probability: float = config.RRT_GOAL_BIAS_PROBABILITY
+    max_iterations: int = config.RRT_MAX_ITERATIONS
+    max_planning_time_s: float = config.RRT_MAX_PLANNING_TIME_S
     random_seed: int = 1
 
     def __post_init__(self) -> None:

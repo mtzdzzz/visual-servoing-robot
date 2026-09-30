@@ -1,4 +1,4 @@
-"""Stage 21 Demo 1: manual red-ball drag plus frozen predictive visual servo."""
+﻿"""Stage 21 Demo 1: manual red-ball drag plus frozen predictive visual servo."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import time
 import pybullet as p
 import pybullet_data
 
-import simulation as sim
-import stage10_evaluation as stage10
-import stage13_evaluation as stage13
+import robotics_core as sim
+import visual_servo_runtime as runtime
+import predictive_measurement as predictive
+import config
 from camera_observation import (
     EyeInHandRgbDisplay, ManualTargetDragController,
     create_manual_draggable_red_ground_target, detect_red_target_from_live_rgb,
@@ -23,7 +24,7 @@ def _quit_requested(client_id: int) -> bool:
     return any(events.get(key, 0) & p.KEY_WAS_TRIGGERED for key in (ord("q"), ord("Q"), 27))
 
 
-def _create_context(client_id: int) -> tuple[stage10.ReadyContext, ManualTargetDragController]:
+def _create_context(client_id: int) -> tuple[runtime.ReadyContext, ManualTargetDragController]:
     p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
     p.setGravity(0, 0, 0, physicsClientId=client_id)
     p.setTimeStep(sim.TIME_STEP, physicsClientId=client_id)
@@ -42,7 +43,7 @@ def _create_context(client_id: int) -> tuple[stage10.ReadyContext, ManualTargetD
     target_id = create_manual_draggable_red_ground_target(client_id)
     axes: list[int] = []
     sim.update_camera_reference_axes(robot_id, client_id, axes)
-    context = stage10.ReadyContext(
+    context = runtime.ReadyContext(
         robot_id=robot_id, target_body_id=target_id, arm_joint_indices=joints,
         active_joint_indices=active, locked_joint_indices=locked,
         locked_initial_positions=locked_positions,
@@ -67,7 +68,7 @@ def run_demo_tracking(*, gui: bool = True, realtime: bool = True, max_frames: in
     initial_error = None
     try:
         context, drag = _create_context(client_id)
-        estimator = TargetMotionEstimator(stage13.PREDICTION_ALPHA, 0.30)
+        estimator = TargetMotionEstimator(predictive.PREDICTION_ALPHA, config.PREDICTION_HORIZON_S)
         print(f"{DEMO_TRACKING_TITLE}: ACTIVE")
         print("Mouse: drag RED | Controller: RGB centroid/prediction only | Q/ESC: quit")
         while p.isConnected(client_id):
@@ -77,7 +78,7 @@ def run_demo_tracking(*, gui: bool = True, realtime: bool = True, max_frames: in
                 break
             if drag is not None and gui:
                 drag.update()
-            stage10._step_physics(context, client_id)
+            runtime.step_physics(context, client_id)
             if step % sim.CAMERA_UPDATE_INTERVAL_STEPS == 0:
                 timestamp = step * sim.TIME_STEP
                 sim.update_camera_reference_axes(context.robot_id, client_id, context.camera_axis_debug_item_ids)
@@ -90,8 +91,8 @@ def run_demo_tracking(*, gui: bool = True, realtime: bool = True, max_frames: in
                     estimate = estimator.update(timestamp, *raw.centroid)
                 else:
                     estimator.target_lost()
-                measurement, source, _ = stage13._predicted_measurement(raw, estimate)
-                stage10._control_latest_measurement(context, measurement, client_id)
+                measurement, source, _ = predictive.predicted_measurement(raw, estimate)
+                runtime.control_latest_measurement(context, measurement, client_id)
                 last_error = raw.pixel_error if raw.detected else None
                 if initial_error is None and last_error is not None:
                     initial_error = last_error
@@ -149,3 +150,5 @@ def run_demo_tracking(*, gui: bool = True, realtime: bool = True, max_frames: in
             display.close()
         if p.isConnected(client_id):
             p.disconnect(physicsClientId=client_id)
+
+

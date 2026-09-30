@@ -12,16 +12,17 @@ import cv2
 import numpy as np
 import pybullet as p
 
-import simulation as sim
-import stage10_evaluation as control
-import stage13_evaluation as predictive
+import robotics_core as sim
+import visual_servo_runtime as control
+import predictive_measurement as predictive
 import stage16_target_switching as selection
+import target_selection_runtime as selection_runtime
 from multi_target_detector import MultiTargetDetector
 from target_manager import TargetManager
 from camera_observation import render_live_eye_in_hand_rgbd_frame
 from rrt_connect_planner import RRTConnectPlanner, RRTConnectConfig
 from trajectory_executor import TrajectoryExecutor
-from stage20_trajectory_execution import Demo, UserExit, LOG_ROOT
+from obstacle_motion_runtime import Demo, UserExit, LOG_ROOT
 
 
 class SelectedTargetDemo(Demo):
@@ -51,7 +52,7 @@ class SelectedTargetDemo(Demo):
             self.last_key_step = self.steps
             # Consume the keyboard only once/step; Stage16 owns ID mapping.
             if self.manual_enabled:
-                event, quit_requested = selection._manual_keyboard_input(self.manager, self.t, self.client)
+                event, quit_requested = selection_runtime.manual_keyboard_input(self.manager, self.t, self.client)
                 if event is not None:
                     self.begin_selection(event)
             else:
@@ -111,7 +112,7 @@ class SelectedTargetDemo(Demo):
         # Also gate tracking deviation toward the most recent direct command.
         if not self.edge_safe(self.edge_configuration(actual), self.edge_configuration(np.asarray(self.context.commanded_joint_targets))):
             raise ValueError("CURRENT_TO_COMMAND_PATH_COLLISION")
-        control._step_physics(self.context, self.client)
+        control.step_physics(self.context, self.client)
         self.steps += 1
         self.t += sim.TIME_STEP
         if self.context.max_locked_deviation >= .005:
@@ -179,13 +180,13 @@ class SelectedTargetDemo(Demo):
         frame = rgbd.live_rgb_frame
         detections = self.detector.detect(frame.rgba_buffer, frame.image_width, frame.image_height)
         estimates = self.manager.update_detections(self.t, detections, selected_only=not self.manual_enabled)
-        raw = selection._controller_detection_from_selected(self.manager.selected_detection(),
+        raw = selection_runtime.controller_detection_from_selected(self.manager.selected_detection(),
             (frame.image_width // 2, frame.image_height // 2), frame.rgba_buffer)
         self.last_measurement = raw
         source = self.manager.controller_source_for_selected(estimates[self.manager.selected_target_id])
         measured = raw
         if source == "PREDICTED":
-            measured, source, _ = predictive._predicted_measurement(raw, estimates[self.manager.selected_target_id])
+            measured, source, _ = predictive.predicted_measurement(raw, estimates[self.manager.selected_target_id])
         self.controller_source = source
         newly_centered = False
         if not raw.detected:
@@ -219,7 +220,7 @@ class SelectedTargetDemo(Demo):
                 self.state = "VISUAL_ALIGNMENT"
                 # Frozen controller writes a PROPOSAL to context, NOT to motors.
                 previous = list(self.context.commanded_joint_targets)
-                issued, _ = control._control_latest_measurement(self.context, measured, self.client)
+                issued, _ = control.control_latest_measurement(self.context, measured, self.client)
                 proposed = list(self.context.commanded_joint_targets)
                 self.context.commanded_joint_targets = previous
                 if issued:
@@ -227,7 +228,7 @@ class SelectedTargetDemo(Demo):
                 else:
                     self.hold_current()
         if self.display or newly_centered:
-            overlay = selection._annotated_overlay(frame.rgba_buffer, frame.image_width,
+            overlay = selection_runtime.annotated_overlay(frame.rgba_buffer, frame.image_width,
                 frame.image_height, detections, self.manager, "STAGE 20 - SELECT / PLAN / ALIGN",
                 self.state, self.controller_source, self.state)
             if self.display:
