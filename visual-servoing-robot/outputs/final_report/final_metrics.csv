@@ -1,0 +1,164 @@
+﻿category,stage,metric,condition,value,unit,source_file,source_column,notes
+Visual Servo,Stage 7,Final ex,Trial 1,-2.0,px,outputs/logs/stage7_trial_01.csv,ex,Last valid detected frame.
+Visual Servo,Stage 7,Final ey,Trial 1,-2.0,px,outputs/logs/stage7_trial_01.csv,ey,Last valid detected frame.
+Visual Servo,Stage 7,Final error norm,Trial 1,2.8284271247461903,px,outputs/logs/stage7_trial_01.csv,error_norm,Last valid detected frame.
+Visual Servo,Stage 7,Convergence time,Trial 1,5.066667,s,outputs/logs/stage7_trial_01.csv,"time_s,servo_state",First frame whose servo_state is 2D CENTERED PRECISE.
+Visual Servo,Stage 7,Final ex,Trial 2,-1.0,px,outputs/logs/stage7_trial_02.csv,ex,Last valid detected frame.
+Visual Servo,Stage 7,Final ey,Trial 2,-2.0,px,outputs/logs/stage7_trial_02.csv,ey,Last valid detected frame.
+Visual Servo,Stage 7,Final error norm,Trial 2,2.23606797749979,px,outputs/logs/stage7_trial_02.csv,error_norm,Last valid detected frame.
+Visual Servo,Stage 7,Convergence time,Trial 2,8.0,s,outputs/logs/stage7_trial_02.csv,"time_s,servo_state",First frame whose servo_state is 2D CENTERED PRECISE.
+Visual Servo,Stage 7,Final ex,Trial 3,-2.0,px,outputs/logs/stage7_trial_03.csv,ex,Last valid detected frame.
+Visual Servo,Stage 7,Final ey,Trial 3,2.0,px,outputs/logs/stage7_trial_03.csv,ey,Last valid detected frame.
+Visual Servo,Stage 7,Final error norm,Trial 3,2.8284271247461903,px,outputs/logs/stage7_trial_03.csv,error_norm,Last valid detected frame.
+Visual Servo,Stage 7,Convergence time,Trial 3,9.333333,s,outputs/logs/stage7_trial_03.csv,"time_s,servo_state",First frame whose servo_state is 2D CENTERED PRECISE.
+Visual Servo,Stage 7,Final ex,Trial 4,0.0,px,outputs/logs/stage7_trial_04.csv,ex,Last valid detected frame.
+Visual Servo,Stage 7,Final ey,Trial 4,2.0,px,outputs/logs/stage7_trial_04.csv,ey,Last valid detected frame.
+Visual Servo,Stage 7,Final error norm,Trial 4,2.0,px,outputs/logs/stage7_trial_04.csv,error_norm,Last valid detected frame.
+Visual Servo,Stage 7,Convergence time,Trial 4,10.533333,s,outputs/logs/stage7_trial_04.csv,"time_s,servo_state",First frame whose servo_state is 2D CENTERED PRECISE.
+Visual Servo,Stage 7,Final ex,Trial 5,-2.0,px,outputs/logs/stage7_trial_05.csv,ex,Last valid detected frame.
+Visual Servo,Stage 7,Final ey,Trial 5,2.0,px,outputs/logs/stage7_trial_05.csv,ey,Last valid detected frame.
+Visual Servo,Stage 7,Final error norm,Trial 5,2.8284271247461903,px,outputs/logs/stage7_trial_05.csv,error_norm,Last valid detected frame.
+Visual Servo,Stage 7,Convergence time,Trial 5,15.6,s,outputs/logs/stage7_trial_05.csv,"time_s,servo_state",First frame whose servo_state is 2D CENTERED PRECISE.
+Visual Servo,Stage 7,Static convergence success rate,5 static trials,100.0,percent,outputs/logs/stage7_trial_01.csv; outputs/logs/stage7_trial_02.csv; outputs/logs/stage7_trial_03.csv; outputs/logs/stage7_trial_04.csv; outputs/logs/stage7_trial_05.csv,"servo_state,ex,ey",Recomputed from all five raw trial CSVs; PASS requires final |ex| and |ey| <= 2 px.
+Visual Servo,Stage 7,Mean convergence time,5 static trials,9.7066666,s,outputs/logs/stage7_trial_01.csv; outputs/logs/stage7_trial_02.csv; outputs/logs/stage7_trial_03.csv; outputs/logs/stage7_trial_04.csv; outputs/logs/stage7_trial_05.csv,"time_s,servo_state",Mean of raw per-trial first 2D CENTERED PRECISE timestamps.
+Visual Servo,Stage 7,Mean final absolute ex,5 static trials,1.4,px,outputs/logs/stage7_trial_01.csv; outputs/logs/stage7_trial_02.csv; outputs/logs/stage7_trial_03.csv; outputs/logs/stage7_trial_04.csv; outputs/logs/stage7_trial_05.csv,ex,Mean across last valid detected frame of each raw trial.
+Visual Servo,Stage 7,Mean final absolute ey,5 static trials,2.0,px,outputs/logs/stage7_trial_01.csv; outputs/logs/stage7_trial_02.csv; outputs/logs/stage7_trial_03.csv; outputs/logs/stage7_trial_04.csv; outputs/logs/stage7_trial_05.csv,ey,Mean across last valid detected frame of each raw trial.
+Visual Servo,Stage 9,Mean tracking error,SLOW,6.027533421285663,px,outputs/logs/stage9_slow.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Tracking RMSE,SLOW,6.59747426419131,px,outputs/logs/stage9_slow.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,P95 tracking error,SLOW,10.198039027185567,px,outputs/logs/stage9_slow.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Maximum tracking error,SLOW,11.180339887498947,px,outputs/logs/stage9_slow.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Detection rate,SLOW,100.0,percent,outputs/logs/stage9_slow.csv,target_detected,600 formal RGB frames.
+Visual Servo,Stage 9,Mean tracking error,MEDIUM,7.500910837991826,px,outputs/logs/stage9_medium.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Tracking RMSE,MEDIUM,8.09135340965898,px,outputs/logs/stage9_medium.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,P95 tracking error,MEDIUM,11.0,px,outputs/logs/stage9_medium.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Maximum tracking error,MEDIUM,11.180339887498947,px,outputs/logs/stage9_medium.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Detection rate,MEDIUM,100.0,percent,outputs/logs/stage9_medium.csv,target_detected,600 formal RGB frames.
+Visual Servo,Stage 9,Mean tracking error,FAST,9.047469915468712,px,outputs/logs/stage9_fast.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Tracking RMSE,FAST,9.912281943797469,px,outputs/logs/stage9_fast.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,P95 tracking error,FAST,14.142135623730953,px,outputs/logs/stage9_fast.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Maximum tracking error,FAST,14.142135623730953,px,outputs/logs/stage9_fast.csv,error_norm,Formal 20 s dynamic measurement after READY; warm-up excluded.
+Visual Servo,Stage 9,Detection rate,FAST,100.0,percent,outputs/logs/stage9_fast.csv,target_detected,600 formal RGB frames.
+Visual Servo,Stage 10,Lost duration,Target lost and recovery,2.5,s,outputs/logs/stage10_summary.csv,lost_duration_s,"Ground truth is used only to schedule/evaluate the visibility event, not for control."
+Visual Servo,Stage 10,Reacquisition time,Target lost and recovery,0.0,s,outputs/logs/stage10_summary.csv,reacquisition_time_s,"Ground truth is used only to schedule/evaluate the visibility event, not for control."
+Visual Servo,Stage 10,Recovery time,Target lost and recovery,0.1333333333333328,s,outputs/logs/stage10_summary.csv,recovery_time_s,"Ground truth is used only to schedule/evaluate the visibility event, not for control."
+Visual Servo,Stage 10,Target lost event count,Target lost and recovery,1.0,count,outputs/logs/stage10_summary.csv,lost_event_count,"Ground truth is used only to schedule/evaluate the visibility event, not for control."
+Visual Servo,Stage 10,Mean error,Noise 0 px,7.500910837991826,px,outputs/logs/stage10_noise_0.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,RMSE,Noise 0 px,8.09135340965898,px,outputs/logs/stage10_noise_0.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,P95 error,Noise 0 px,11.0,px,outputs/logs/stage10_noise_0.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,Maximum error,Noise 0 px,11.180339887498947,px,outputs/logs/stage10_noise_0.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,Mean error,Noise 1 px,7.299621252861726,px,outputs/logs/stage10_noise_1.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,RMSE,Noise 1 px,7.913385284861762,px,outputs/logs/stage10_noise_1.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,P95 error,Noise 1 px,11.04536101718726,px,outputs/logs/stage10_noise_1.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,Maximum error,Noise 1 px,11.04536101718726,px,outputs/logs/stage10_noise_1.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,Mean error,Noise 3 px,6.595727462196762,px,outputs/logs/stage10_noise_3.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,RMSE,Noise 3 px,7.164844729650462,px,outputs/logs/stage10_noise_3.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,P95 error,Noise 3 px,10.0,px,outputs/logs/stage10_noise_3.csv,error_norm,Single fixed-seed noise experiment.
+Visual Servo,Stage 10,Maximum error,Noise 3 px,11.0,px,outputs/logs/stage10_noise_3.csv,error_norm,Single fixed-seed noise experiment.
+Prediction,Stage 12,Baseline future mean error,Online estimator log,0.6287638620523868,px,outputs/logs/stage12_motion_estimation.csv,baseline_future_error,Prediction is evaluation-only and is not used by the controller in Stage 12.
+Prediction,Stage 12,Baseline future RMSE,Online estimator log,0.8233178906068351,px,outputs/logs/stage12_motion_estimation.csv,baseline_future_error,Prediction is evaluation-only and is not used by the controller in Stage 12.
+Prediction,Stage 12,EMA future mean error,Online estimator log,0.693710181705087,px,outputs/logs/stage12_motion_estimation.csv,motion_prediction_future_error,Prediction is evaluation-only and is not used by the controller in Stage 12.
+Prediction,Stage 12,EMA future RMSE,Online estimator log,0.899081318555666,px,outputs/logs/stage12_motion_estimation.csv,motion_prediction_future_error,Prediction is evaluation-only and is not used by the controller in Stage 12.
+Prediction,Stage 12,Mean-error improvement,Online estimator log,-10.32920680916759,percent,outputs/logs/stage12_motion_estimation.csv,"baseline_future_error,motion_prediction_future_error",Prediction is evaluation-only and is not used by the controller in Stage 12.
+Prediction,Stage 12B,Lowest prediction RMSE,"alpha=0.2, tau=0.05 s",0.6255726141137068,px,outputs/logs/stage12b_prediction_grid.csv,prediction_rmse,Lowest absolute prediction RMSE among all 25 offline configurations.
+Prediction,Stage 12B,Best mean-error improvement,"alpha=0.2, tau=0.3 s",22.019577706800227,percent,outputs/logs/stage12b_prediction_grid.csv,improvement_percent,Best recorded mean-error improvement; all 25 configurations remain in the source grid.
+Prediction,Stage 13,Mean raw tracking error,MEDIUM baseline,7.500910837991826,px,outputs/logs/stage13_baseline_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,MEDIUM baseline,8.09135340965898,px,outputs/logs/stage13_baseline_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,MEDIUM baseline,11.0,px,outputs/logs/stage13_baseline_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,MEDIUM baseline,11.180339887498947,px,outputs/logs/stage13_baseline_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,MEDIUM predictive tau=0.15 s,7.08112800796767,px,outputs/logs/stage13_predictive_tau150_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,MEDIUM predictive tau=0.15 s,7.614897679330082,px,outputs/logs/stage13_predictive_tau150_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,MEDIUM predictive tau=0.15 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau150_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,MEDIUM predictive tau=0.15 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau150_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,MEDIUM predictive tau=0.20 s,7.013488077727724,px,outputs/logs/stage13_predictive_tau200_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,MEDIUM predictive tau=0.20 s,7.553365695723552,px,outputs/logs/stage13_predictive_tau200_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,MEDIUM predictive tau=0.20 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau200_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,MEDIUM predictive tau=0.20 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau200_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,MEDIUM predictive tau=0.30 s,6.8027578626043,px,outputs/logs/stage13_predictive_tau300_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,MEDIUM predictive tau=0.30 s,7.332803011127464,px,outputs/logs/stage13_predictive_tau300_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,MEDIUM predictive tau=0.30 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau300_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,MEDIUM predictive tau=0.30 s,10.04987562112089,px,outputs/logs/stage13_predictive_tau300_medium.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,FAST baseline,9.047469915468698,px,outputs/logs/stage13_baseline_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,FAST baseline,9.912281943797469,px,outputs/logs/stage13_baseline_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,FAST baseline,14.142135623730953,px,outputs/logs/stage13_baseline_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,FAST baseline,14.142135623730953,px,outputs/logs/stage13_baseline_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,FAST predictive tau=0.15 s,8.398087733256727,px,outputs/logs/stage13_predictive_tau150_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,FAST predictive tau=0.15 s,9.101831317560952,px,outputs/logs/stage13_predictive_tau150_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,FAST predictive tau=0.15 s,12.041594578792296,px,outputs/logs/stage13_predictive_tau150_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,FAST predictive tau=0.15 s,13.038404810405298,px,outputs/logs/stage13_predictive_tau150_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,FAST predictive tau=0.20 s,8.163484047588845,px,outputs/logs/stage13_predictive_tau200_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,FAST predictive tau=0.20 s,8.836477427874375,px,outputs/logs/stage13_predictive_tau200_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,FAST predictive tau=0.20 s,12.041594578792296,px,outputs/logs/stage13_predictive_tau200_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,FAST predictive tau=0.20 s,12.041594578792296,px,outputs/logs/stage13_predictive_tau200_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Mean raw tracking error,FAST predictive tau=0.30 s,7.707724805984539,px,outputs/logs/stage13_predictive_tau300_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Raw tracking RMSE,FAST predictive tau=0.30 s,8.337065830774437,px,outputs/logs/stage13_predictive_tau300_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,P95 raw tracking error,FAST predictive tau=0.30 s,11.04536101718726,px,outputs/logs/stage13_predictive_tau300_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,Maximum raw tracking error,FAST predictive tau=0.30 s,12.041594578792296,px,outputs/logs/stage13_predictive_tau300_fast.csv,error_norm_raw,Performance is evaluated from raw RGB centroid error.
+Prediction,Stage 13,RMSE improvement,MEDIUM,9.374827178182628,percent,outputs/logs/stage13_summary.csv,rmse,Baseline versus best online-tested predictive horizon tau=0.30 s.
+Prediction,Stage 13,Mean error improvement,MEDIUM,9.307575979325184,percent,outputs/logs/stage13_summary.csv,mean_tracking_error,Baseline versus best online-tested predictive horizon tau=0.30 s.
+Prediction,Stage 13,P95 error improvement,MEDIUM,8.637494353446455,percent,outputs/logs/stage13_summary.csv,p95_error,Baseline versus best online-tested predictive horizon tau=0.30 s.
+Prediction,Stage 13,RMSE improvement,FAST,15.891558794982732,percent,outputs/logs/stage13_summary.csv,rmse,Baseline versus best online-tested predictive horizon tau=0.30 s.
+Prediction,Stage 13,Mean error improvement,FAST,14.807953184719198,percent,outputs/logs/stage13_summary.csv,mean_tracking_error,Baseline versus best online-tested predictive horizon tau=0.30 s.
+Prediction,Stage 13,P95 error improvement,FAST,21.897503240933478,percent,outputs/logs/stage13_summary.csv,p95_error,Baseline versus best online-tested predictive horizon tau=0.30 s.
+RGB-D Perception,Stage 14,3D center error,center,17.337828523416487,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Sphere-center estimate after known-radius surface compensation.
+RGB-D Perception,Stage 14,3D center error,left,10.080376944604652,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Sphere-center estimate after known-radius surface compensation.
+RGB-D Perception,Stage 14,3D center error,right,26.25564874014286,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Sphere-center estimate after known-radius surface compensation.
+RGB-D Perception,Stage 14,3D center error,near,14.540471418642046,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Sphere-center estimate after known-radius surface compensation.
+RGB-D Perception,Stage 14,3D center error,far,20.115878827942357,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Sphere-center estimate after known-radius surface compensation.
+RGB-D Perception,Stage 14,Mean 3D error,5 static positions,17.66604089094968,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Aggregate across the five position summaries.
+RGB-D Perception,Stage 14,RMSE 3D error,5 static positions,18.480515567025083,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Aggregate across the five position summaries.
+RGB-D Perception,Stage 14,Median 3D error,5 static positions,17.337828523416487,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Aggregate across the five position summaries.
+RGB-D Perception,Stage 14,Maximum 3D error,5 static positions,26.25564874014286,mm,outputs/logs/stage14_rgbd_summary.csv,center_error_3d_mm,Aggregate across the five position summaries.
+Multi-Target,Stage 15,Detection rate,RED,100.0,percent,outputs/logs/stage15_summary.csv,detection_rate_percent,Detection from Eye-in-Hand RGB; no segmentation ground truth used.
+Multi-Target,Stage 15,Mean 3D localization error,RED,4.9967307536649,mm,outputs/logs/stage15_summary.csv,mean_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,RMSE 3D localization error,RED,5.461556848442901,mm,outputs/logs/stage15_summary.csv,rmse_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,Maximum 3D localization error,RED,9.210773661657399,mm,outputs/logs/stage15_summary.csv,max_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,Detection rate,GREEN,100.0,percent,outputs/logs/stage15_summary.csv,detection_rate_percent,Detection from Eye-in-Hand RGB; no segmentation ground truth used.
+Multi-Target,Stage 15,Mean 3D localization error,GREEN,35.7968774970034,mm,outputs/logs/stage15_summary.csv,mean_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,RMSE 3D localization error,GREEN,38.5486754676423,mm,outputs/logs/stage15_summary.csv,rmse_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,Maximum 3D localization error,GREEN,63.701842132054196,mm,outputs/logs/stage15_summary.csv,max_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,Detection rate,BLUE,100.0,percent,outputs/logs/stage15_summary.csv,detection_rate_percent,Detection from Eye-in-Hand RGB; no segmentation ground truth used.
+Multi-Target,Stage 15,Mean 3D localization error,BLUE,31.278596428916796,mm,outputs/logs/stage15_summary.csv,mean_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,RMSE 3D localization error,BLUE,32.870749390551,mm,outputs/logs/stage15_summary.csv,rmse_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,Maximum 3D localization error,BLUE,50.7150432571667,mm,outputs/logs/stage15_summary.csv,max_3d_error_m,Converted from metres to millimetres for presentation.
+Multi-Target,Stage 15,All-target detection rate,RED+GREEN+BLUE,100.0,percent,outputs/logs/stage15_summary.csv,all_targets_detection_rate_percent,All three targets detected in the same frame.
+Multi-Target,Stage 15,Color confusion count,RED+GREEN+BLUE,0.0,count,outputs/logs/stage15_summary.csv,target_confusion_events,Count reported by the formal Stage 15 evaluation.
+Multi-Target,Stage 16,Switch trial count,Historical formal switching log,6.0,count,outputs/logs/stage16_summary.csv,record_type,Includes all recorded switch events.
+Multi-Target,Stage 16,Switch success rate,Historical formal switching log,50.0,percent,outputs/logs/stage16_summary.csv,switch_success_rate_percent,Historical overall result is FAIL.
+Multi-Target,Stage 16,Mean successful switch response time,Historical formal switching log,6.298611111111112,s,outputs/logs/stage16_summary.csv,mean_switch_response_time_s,Historical overall result is FAIL.
+Multi-Target,Stage 16,Maximum successful switch response time,Historical formal switching log,6.995833333333334,s,outputs/logs/stage16_summary.csv,max_switch_response_time_s,Historical overall result is FAIL.
+Multi-Target,Stage 16,Target lost event count,Historical formal switching log,0.0,count,outputs/logs/stage16_summary.csv,target_lost_events,Historical overall result is FAIL.
+Multi-Target,Stage 16,Locked-joint maximum deviation,Historical formal switching log,0.0201506356137606,rad,outputs/logs/stage16_summary.csv,locked_joint_max_deviation_rad,Historical overall result is FAIL.
+Obstacle Perception,Stage 17,Obstacle detection rate,5 obstacle scenes,100.0,percent,outputs/logs/stage17_summary.csv,detection_rate,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Mean center error,5 obstacle scenes,7.998325,mm,outputs/logs/stage17_summary.csv,mean_center_error_m,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,RMSE center error,5 obstacle scenes,8.92714,mm,outputs/logs/stage17_summary.csv,rmse_center_error_m,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Maximum center error,5 obstacle scenes,14.887858,mm,outputs/logs/stage17_summary.csv,max_center_error_m,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Mean AABB IoU,5 obstacle scenes,40.8163265,percent,outputs/logs/stage17_summary.csv,mean_aabb_iou,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Mean GT coverage,5 obstacle scenes,100.0,percent,outputs/logs/stage17_summary.csv,mean_gt_coverage,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Estimated-to-GT volume ratio,5 obstacle scenes,2.45,ratio,outputs/logs/stage17_summary.csv,mean_volume_ratio,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Obstacle Perception,Stage 17,Target color confusion count,5 obstacle scenes,0.0,count,outputs/logs/stage17_summary.csv,target_confusion_count,Occupancy is deliberately conservative; ground truth is evaluation-only.
+Collision Safety,Stage 18,TP,20 candidate paths,7.0,count,outputs/logs/stage18_summary.csv,true_positive,GT collision is used only as the evaluation oracle.
+Collision Safety,Stage 18,TN,20 candidate paths,7.0,count,outputs/logs/stage18_summary.csv,true_negative,GT collision is used only as the evaluation oracle.
+Collision Safety,Stage 18,FP,20 candidate paths,6.0,count,outputs/logs/stage18_summary.csv,false_positive,GT collision is used only as the evaluation oracle.
+Collision Safety,Stage 18,FN,20 candidate paths,0.0,count,outputs/logs/stage18_summary.csv,false_negative,GT collision is used only as the evaluation oracle.
+Collision Safety,Stage 18,Precision,20 candidate paths,53.84615384615385,percent,outputs/logs/stage18_summary.csv,precision,Safety recall is TP/(TP+FN).
+Collision Safety,Stage 18,Recall,20 candidate paths,100.0,percent,outputs/logs/stage18_summary.csv,recall,Safety recall is TP/(TP+FN).
+Collision Safety,Stage 18,Safety recall,20 candidate paths,100.0,percent,outputs/logs/stage18_summary.csv,safety_recall,Safety recall is TP/(TP+FN).
+Planning,Stage 19,Scenario count,Tested scenarios and seeds,10.0,count,outputs/logs/stage19_summary.csv,scenarios,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,RRT trial count,Tested scenarios and seeds,25.0,count,outputs/logs/stage19_summary.csv,rrt_trials,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,RRT planning success rate,Tested scenarios and seeds,100.0,percent,outputs/logs/stage19_summary.csv,rrt_planning_success_rate,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,Mean planning time,Tested scenarios and seeds,0.1189343560033012,s,outputs/logs/stage19_summary.csv,mean_planning_time_s,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,Median planning time,Tested scenarios and seeds,0.0962394000089261,s,outputs/logs/stage19_summary.csv,median_planning_time_s,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,Maximum planning time,Tested scenarios and seeds,0.4901539999991655,s,outputs/logs/stage19_summary.csv,max_planning_time_s,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,Mean RRT path length,Tested scenarios and seeds,2.459476954007273,rad,outputs/logs/stage19_summary.csv,mean_raw_path_length,Planning uses estimated occupancy; GT is final evaluation only.
+Planning,Stage 19,Final GT path collision count,Tested scenarios and seeds,0.0,count,outputs/logs/stage19_summary.csv,final_path_gt_collision_count,Planning uses estimated occupancy; GT is final evaluation only.
+Execution,Stage 20,Execution trial count,2 direct + 3 RRT,5.0,count,outputs/logs/stage20_summary.csv,scenario,All formal execution trials.
+Execution,Stage 20,Execution success rate,2 direct + 3 RRT,100.0,percent,outputs/logs/stage20_summary.csv,execution_success,Success across the five tested execution scenarios.
+Execution,Stage 20,Mean execution time,DIRECT,2.766666667,s,outputs/logs/stage20_summary.csv,execution_time_s,Mean over formal trials with this execution source.
+Execution,Stage 20,Mean execution time,RRT_CONNECT,18.6375,s,outputs/logs/stage20_summary.csv,execution_time_s,Mean over formal trials with this execution source.
+Execution,Stage 20,Mean goal joint error,5 formal trials,0.0019647754000000003,rad,outputs/logs/stage20_summary.csv,goal_joint_error_rad,Mean final maximum active-joint error.
+Execution,Stage 20,Maximum goal joint error,5 formal trials,0.001978714,rad,outputs/logs/stage20_summary.csv,goal_joint_error_rad,Maximum across formal trials.
+Execution,Stage 20,Mean joint tracking error,All raw trajectory samples,0.015344097174476165,rad,outputs/logs/stage20_execution.csv,tracking_error,The historical writer stamped every row GOAL_REACHED; metrics are recomputed over all raw trajectory samples and agree with the per-scenario summary.
+Execution,Stage 20,RMSE joint tracking error,All raw trajectory samples,0.019929216031191473,rad,outputs/logs/stage20_execution.csv,tracking_error,The historical writer stamped every row GOAL_REACHED; metrics are recomputed over all raw trajectory samples and agree with the per-scenario summary.
+Execution,Stage 20,Maximum joint tracking error,All raw trajectory samples,0.049916019,rad,outputs/logs/stage20_execution.csv,tracking_error,The historical writer stamped every row GOAL_REACHED; metrics are recomputed over all raw trajectory samples and agree with the per-scenario summary.
+Execution,Stage 20,Locked-joint maximum deviation,5 formal trials,6.3324e-05,rad,outputs/logs/stage20_summary.csv,locked_joint_max_deviation_rad,Maximum across formal trials.
+Execution,Stage 20,GT collision count,5 formal trials,0.0,count,outputs/logs/stage20_summary.csv,gt_collision_count,Evaluation-only ground-truth contact count.

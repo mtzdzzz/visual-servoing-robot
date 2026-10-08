@@ -1,0 +1,55 @@
+visual-servoing-robot/
+|-- src/
+|   |-- simulation.py                 # CLI parsing and dispatch only
+|   |-- robotics_core.py              # established robot/servo implementation
+|   |-- config.py                     # read-only authoritative parameter inventory
+|   |-- camera_observation.py         # synchronized Eye-in-Hand RGB/RGB-D acquisition
+|   |-- camera_geometry.py            # validated T_W_C and render-frame geometry
+|   |-- visual_servo_runtime.py       # shared latest-frame servo/motor runtime
+|   |-- predictive_measurement.py     # shared Stage 13 prediction adapter
+|   |-- target_motion_estimator.py
+|   |-- multi_target_detector.py
+|   |-- target_manager.py
+|   |-- target_selection_runtime.py   # manual selection input/adaptation/overlay
+|   |-- rgbd_localization.py
+|   |-- obstacle_detector.py
+|   |-- obstacle_localization.py
+|   |-- obstacle_perception_runtime.py
+|   |-- collision_checker.py
+|   |-- rrt_connect_planner.py
+|   |-- trajectory_executor.py
+|   |-- scene_factory.py
+|   |-- planning_visualization.py
+|   |-- experiment_logging.py
+|   |-- demo_tracking.py
+|   |-- demo_multitarget.py
+|   |-- demo_obstacle.py
+|   |-- demo_config.py
+|   |-- demo_ui.py
+|   |-- stage*_evaluation.py          # historical experiment reproduction
+|   |-- plot_stage*.py
+|   `-- test_*.py
+|-- outputs/
+|   |-- logs/                         # experiment CSV/summary logs
+|   |-- figures/                      # Stage figures
+|   |-- final_figures/                # final report figures
+|   |-- final_tables/                 # audits, summaries, demo commands
+|   `-- paths/                        # saved validated joint paths
+`-- .venv/                            # omitted from structure audit
+
+Runtime dependency direction:
+
+  simulation.py -> demos / Stage runners -> shared core modules
+                                           -> robotics_core.py
+
+Core modules do not import Stage runners. Demo modules do not call Stage-private helpers.
+
+Python runtime dependencies observed in the project environment:
+  pybullet 3.2.7
+  numpy 2.2.6
+  opencv-python 5.0.0.93
+  pandas 2.3.3
+  matplotlib 3.10.9
+  pillow 12.3.0
+
+No ROS, TensorFlow, Torch, or YOLO dependency was added.

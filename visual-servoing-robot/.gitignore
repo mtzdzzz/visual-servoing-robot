@@ -4,5 +4,24 @@
 .venv-broken-python313/
 
 __pycache__/
-*.pyc
-outputs/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+.vscode/
+.idea/
+*.code-workspace
+
+.DS_Store
+Thumbs.db
+*.log
+
+# Intermediate/reproducible experiment artifacts. Curated final reports,
+# figures, tables, documentation, and README assets remain versionable.
+outputs/*
+!outputs/final_report/
+!outputs/final_report/**
+!outputs/final_tables/
+!outputs/final_tables/**
+!outputs/final_figures/
+!outputs/final_figures/**
